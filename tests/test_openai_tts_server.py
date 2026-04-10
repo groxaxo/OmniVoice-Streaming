@@ -201,6 +201,38 @@ class OpenAITTSServerTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 422)
 
+    def test_audio_endpoint_uses_upstream_default_generation_params(self) -> None:
+        """Verify the server builds a config matching upstream OmniVoice defaults.
+
+        Regression guard: ensures the server never silently uses wrong generation
+        parameters that caused gibberish output before the mask fix.
+        """
+        fake_model = _FakeModel()
+
+        with (
+            patch.object(service, "get_model", new=AsyncMock(return_value=fake_model)),
+            patch(
+                "omnivoice.openai_tts_server._waveform_to_bytes",
+                return_value=(b"audio-bytes", "audio/mpeg"),
+            ),
+            TestClient(app) as client,
+        ):
+            response = client.post(
+                "/v1/audio/speech",
+                json={"input": "Hello world", "voice": "alloy", "response_format": "mp3"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        gen = fake_model.calls[0]["generation_config"]
+        self.assertEqual(gen.num_step, 32)
+        self.assertAlmostEqual(gen.guidance_scale, 2.0)
+        self.assertAlmostEqual(gen.t_shift, 0.1)
+        self.assertAlmostEqual(gen.layer_penalty_factor, 5.0)
+        self.assertAlmostEqual(gen.position_temperature, 5.0)
+        self.assertAlmostEqual(gen.class_temperature, 0.0)
+        self.assertTrue(gen.denoise)
+        self.assertTrue(gen.postprocess_output)
+
     def test_frontend_page_shows_credits_and_voice_summary(self) -> None:
         with TestClient(app) as client:
             response = client.get("/ui")
