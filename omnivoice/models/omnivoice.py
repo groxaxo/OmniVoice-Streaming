@@ -266,7 +266,11 @@ class OmniVoice(PreTrainedModel):
             )
             if resolved_device.startswith("cuda"):
                 configure_cuda_inference(load_device)
-                kwargs.setdefault("attn_implementation", "flex_attention")
+                # OmniVoice is a custom model that does not register SDPA/flex_attention
+                # dispatch; use eager (still benefits from TF32 and cuDNN tuning set
+                # above).  flex_attention requires a Triton kernel that exceeds the
+                # RTX 3060's shared-memory limit (107 KB needed vs 99 KB available).
+                kwargs.setdefault("attn_implementation", "eager")
         elif resolved_dtype is not None:
             kwargs["dtype"] = resolved_dtype
 
@@ -1222,20 +1226,16 @@ class OmniVoice(PreTrainedModel):
         batch_audio_mask = torch.zeros(
             (2 * B, max_c_len), dtype=torch.bool, device=self.device
         )
-        batch_document_ids = _build_block_mask_document_ids(
-            c_lens + task.target_lens,
-            max_seq_len=max_c_len,
-            device=self.device,
+        # Build a 2D padding mask [2*B, max_c_len]: 1 for real tokens, 0 for padding.
+        # This is equivalent to the old flex_attention BlockMask (real tokens share
+        # doc_id=0 and attend to each other; padding positions are excluded).
+        # Using a plain tensor avoids the Triton kernel that exceeds the RTX 3060's
+        # shared-memory budget.
+        all_lens = torch.tensor(
+            c_lens + list(task.target_lens), dtype=torch.long, device=self.device
         )
-        batch_attention_mask = create_block_mask(
-            partial(_mask_mod_packed, batch_document_ids),
-            B=2 * B,
-            H=None,
-            Q_LEN=max_c_len,
-            KV_LEN=max_c_len,
-            _compile=True,
-            device=self.device,
-        )
+        pos = torch.arange(max_c_len, device=self.device)
+        batch_attention_mask = (pos.unsqueeze(0) < all_lens.unsqueeze(1)).long()
 
         for i, inp in enumerate(inputs_list):
             c_len, u_len = c_lens[i], task.target_lens[i]
