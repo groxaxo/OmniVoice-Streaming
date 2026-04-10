@@ -38,14 +38,16 @@ import os
 import signal
 import time
 import traceback
+from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from functools import lru_cache
 from typing import List, Optional, Tuple
 
 import torch
 import torchaudio
 from tqdm import tqdm
 
-from omnivoice.models.omnivoice import OmniVoice
+from omnivoice.models.omnivoice import OmniVoice, VoiceClonePrompt
 from omnivoice.utils.audio import load_audio
 from omnivoice.utils.common import get_best_device_and_count, str2bool
 from omnivoice.utils.data_utils import read_test_list
@@ -54,6 +56,53 @@ from omnivoice.utils.duration import RuleDurationEstimator
 
 worker_model = None
 SAMPLING_RATE = 24000
+
+# Per-worker voice-clone prompt cache (keyed by resolved path + ref_text).
+# Each worker is an independent subprocess, so this dict is process-local.
+_worker_prompt_cache: OrderedDict = OrderedDict()
+_WORKER_PROMPT_CACHE_MAXSIZE = 128
+
+
+@lru_cache(maxsize=4096)
+def _probe_audio_duration_seconds(path: str) -> float:
+    """Return audio duration using metadata only — no full decode.
+
+    Falls back to loading the file if ``torchaudio.info`` fails (e.g. for
+    formats like pydub-only files).
+    """
+    try:
+        info = torchaudio.info(path)
+        return info.num_frames / info.sample_rate
+    except Exception:
+        wav = load_audio(path, SAMPLING_RATE)
+        return wav.shape[-1] / SAMPLING_RATE
+
+
+def _get_or_create_voice_clone_prompt(
+    ref_audio_path: str,
+    ref_text: Optional[str],
+    preprocess_prompt: bool,
+) -> VoiceClonePrompt:
+    """Return a cached ``VoiceClonePrompt``, computing it only on first use.
+
+    The cache is process-local (one per worker) so there is no cross-process
+    sharing or locking overhead.
+    """
+    global _worker_prompt_cache
+    key = (os.path.abspath(ref_audio_path), ref_text, preprocess_prompt)
+    if key in _worker_prompt_cache:
+        _worker_prompt_cache.move_to_end(key)
+        return _worker_prompt_cache[key]
+    prompt = worker_model.create_voice_clone_prompt(
+        ref_audio=ref_audio_path,
+        ref_text=ref_text,
+        preprocess_prompt=preprocess_prompt,
+    )
+    _worker_prompt_cache[key] = prompt
+    _worker_prompt_cache.move_to_end(key)
+    if len(_worker_prompt_cache) > _WORKER_PROMPT_CACHE_MAXSIZE:
+        _worker_prompt_cache.popitem(last=False)
+    return prompt
 
 
 def get_parser():
@@ -249,8 +298,7 @@ def estimate_sample_total_duration(
     ref_audio_path: str,
     gen_duration: Optional[float] = None,
 ) -> float:
-    ref_wav = load_audio(ref_audio_path, SAMPLING_RATE)
-    ref_duration = ref_wav.shape[-1] / SAMPLING_RATE
+    ref_duration = _probe_audio_duration_seconds(ref_audio_path)
 
     if gen_duration is None:
         gen_duration = duration_estimator.estimate_duration(
@@ -360,16 +408,33 @@ def run_inference_batch(
         durations.append(dur)
         speeds.append(spd)
 
+    preprocess_prompt = gen_kwargs.get("preprocess_prompt", True)
+
+    # Build voice-clone prompts upfront using the per-worker LRU cache.
+    # Repeated references to the same audio file are tokenised only once.
+    if any(p is not None for p in ref_audio_paths):
+        voice_clone_prompts = [
+            _get_or_create_voice_clone_prompt(path, ref_text, preprocess_prompt)
+            if path is not None else None
+            for path, ref_text in zip(ref_audio_paths, ref_texts)
+        ]
+        generate_kwargs = dict(
+            text=texts,
+            language=langs,
+            voice_clone_prompt=voice_clone_prompts,
+            duration=durations if any(d is not None for d in durations) else None,
+            speed=speeds if any(s is not None for s in speeds) else None,
+        )
+    else:
+        generate_kwargs = dict(
+            text=texts,
+            language=langs,
+            duration=durations if any(d is not None for d in durations) else None,
+            speed=speeds if any(s is not None for s in speeds) else None,
+        )
+
     start_time = time.time()
-    audios = worker_model.generate(
-        text=texts,
-        language=langs,
-        ref_audio=ref_audio_paths,
-        ref_text=ref_texts,
-        duration=durations if any(d is not None for d in durations) else None,
-        speed=speeds if any(s is not None for s in speeds) else None,
-        **gen_kwargs,
-    )
+    audios = worker_model.generate(**generate_kwargs, **gen_kwargs)
     batch_synth_time = time.time() - start_time
 
     results = []

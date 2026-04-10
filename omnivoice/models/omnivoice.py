@@ -732,11 +732,30 @@ class OmniVoice(PreTrainedModel):
         """
         tokenizer_device = self.audio_tokenizer.device
         if isinstance(tokens, list):
+            # Decode all chunks in a single batched tokenizer call.
+            # Pad to the longest chunk along the time axis so we can stack.
+            max_t = max(t.size(-1) for t in tokens)
+            pad_id = 0
+            padded = torch.stack(
+                [
+                    torch.nn.functional.pad(
+                        t, (0, max_t - t.size(-1)), value=pad_id
+                    )
+                    for t in tokens
+                ],
+                dim=0,
+            ).to(tokenizer_device)  # (N, C, T_max)
+            # Decode as a single batch — audio_values is (N, 1, T_wav).
+            decoded_batch = (
+                self.audio_tokenizer.decode(padded).audio_values.cpu()
+            )
+            # Trim each chunk's waveform to match its original token length.
+            samples_per_token = (
+                decoded_batch.shape[-1] // max_t if max_t > 0 else 1
+            )
             chunk_audios = [
-                self.audio_tokenizer.decode(t.to(tokenizer_device).unsqueeze(0))
-                .audio_values[0]
-                .cpu()
-                for t in tokens
+                decoded_batch[j, :, : t.size(-1) * samples_per_token]
+                for j, t in enumerate(tokens)
             ]
             audio_waveform = cross_fade_chunks(chunk_audios, self.sampling_rate)
         else:

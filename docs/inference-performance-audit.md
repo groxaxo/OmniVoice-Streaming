@@ -29,6 +29,9 @@ These are still present after the changes above and should be treated as follow-
 3. **Chunked long-form generation remains sequential within an utterance.** `omnivoice/models/omnivoice.py::_generate_chunked()` batches across items, but chunk dependencies still serialize work within each long sample.
 4. **Audio decode/post-process work is still per-item.** The final tokenizer decode, silence trimming, cross-fade, and fade/pad steps remain outside the main generation loop and are not batched.
 
+For an implementation-oriented follow-up that only covers **quality-safe**
+optimizations, see `docs/quality-safe-pipeline-optimizations.md`.
+
 ## Ampere-specific guidance
 
 For RTX 30-series and other Ampere GPUs, the best current path in this repo is:

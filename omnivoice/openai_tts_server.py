@@ -10,7 +10,7 @@ import math
 import os
 import re
 import subprocess
-import tempfile
+import io
 import time
 import unicodedata
 from contextlib import asynccontextmanager
@@ -1590,56 +1590,66 @@ def _waveform_to_bytes(
 
     waveform = waveform.detach().cpu().float().clamp(-1.0, 1.0).contiguous()
 
-    with tempfile.TemporaryDirectory(prefix="omnivoice-tts-") as tmp_dir:
-        tmp_path = Path(tmp_dir)
-        wav_path = tmp_path / "output.wav"
-        torchaudio.save(str(wav_path), waveform, sample_rate, format="wav")
+    # Encode WAV entirely in memory — no temp files needed.
+    wav_buffer = io.BytesIO()
+    torchaudio.save(wav_buffer, waveform, sample_rate, format="wav")
+    wav_bytes = wav_buffer.getvalue()
 
-        if response_format == "wav":
-            return wav_path.read_bytes(), media_type
+    if response_format == "wav":
+        return wav_bytes, media_type
 
-        out_path = tmp_path / f"output.{suffix}"
-        ffmpeg_cmd = [
-            "ffmpeg",
-            "-y",
-            "-loglevel",
-            "error",
-            "-i",
-            str(wav_path),
-        ]
+    # For compressed formats, pipe WAV bytes to ffmpeg via stdin and read
+    # the encoded output from stdout.  This avoids writing any temp files.
+    _container_format = {
+        "mp3": "mp3",
+        "flac": "flac",
+        "ogg": "ogg",
+        "opus": "ogg",  # libopus in an Ogg container (same as .opus extension)
+    }
+    container = _container_format.get(response_format)
+    if container is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported response_format '{response_format}'",
+        )
 
-        if response_format == "mp3":
-            ffmpeg_cmd += ["-codec:a", "libmp3lame", "-b:a", "192k"]
-        elif response_format == "flac":
-            ffmpeg_cmd += ["-codec:a", "flac"]
-        elif response_format in {"ogg", "opus"}:
-            ffmpeg_cmd += ["-codec:a", "libopus"]
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unsupported response_format '{response_format}'",
-            )
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        "-f", "wav",
+        "-i", "pipe:0",   # read WAV from stdin
+    ]
 
-        ffmpeg_cmd.append(str(out_path))
-        try:
-            subprocess.run(
-                ffmpeg_cmd,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-        except FileNotFoundError as exc:
-            raise HTTPException(
-                status_code=500,
-                detail="ffmpeg is required to encode the requested audio format",
-            ) from exc
-        except subprocess.CalledProcessError as exc:
-            stderr = (exc.stderr or "").strip()
-            raise HTTPException(
-                status_code=500,
-                detail=f"Audio encoding failed: {stderr or exc}",
-            ) from exc
-        return out_path.read_bytes(), media_type
+    if response_format == "mp3":
+        ffmpeg_cmd += ["-codec:a", "libmp3lame", "-b:a", "192k"]
+    elif response_format == "flac":
+        ffmpeg_cmd += ["-codec:a", "flac"]
+    elif response_format in {"ogg", "opus"}:
+        ffmpeg_cmd += ["-codec:a", "libopus"]
+
+    ffmpeg_cmd += ["-f", container, "pipe:1"]  # write to stdout
+
+    try:
+        result = subprocess.run(
+            ffmpeg_cmd,
+            input=wav_bytes,
+            check=True,
+            capture_output=True,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="ffmpeg is required to encode the requested audio format",
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or b"").decode(errors="replace").strip()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Audio encoding failed: {stderr or exc}",
+        ) from exc
+    return result.stdout, media_type
 
 
 async def _synthesize_prepared(
