@@ -329,29 +329,36 @@ def cross_fade_chunks(
     total_n = int(silence_duration * sample_rate)
     fade_n = total_n // 3
     silence_n = fade_n  # middle silent gap
-    merged = chunks[0].clone()
 
-    for chunk in chunks[1:]:
-        dev, dt = merged.device, merged.dtype
-        parts = [merged]
+    # Single-pass: collect all segments in a flat list and cat once at the end.
+    # The iterative approach grew `merged` by torch.cat on every iteration,
+    # which copies all previously accumulated audio O(N) times — O(N²) total.
+    # Here we process each chunk independently and do one final torch.cat.
+    parts: list[torch.Tensor] = []
+    for idx, chunk in enumerate(chunks):
+        dev, dt = chunk.device, chunk.dtype
+        piece = chunk.clone()
 
-        # Fade out tail of current merged audio
-        fout_n = min(fade_n, merged.size(-1))
-        if fout_n > 0:
-            w_out = torch.linspace(1, 0, fout_n, device=dev, dtype=dt)[None, :]
-            parts[-1][..., -fout_n:] = parts[-1][..., -fout_n:] * w_out
+        # Fade-out on the tail of every chunk except the last
+        if idx < len(chunks) - 1:
+            fout_n = min(fade_n, piece.size(-1))
+            if fout_n > 0:
+                w_out = torch.linspace(1, 0, fout_n, device=dev, dtype=dt)[None, :]
+                piece[..., -fout_n:] = piece[..., -fout_n:] * w_out
 
-        # Silent buffer between chunks
-        parts.append(torch.zeros(chunks[0].shape[0], silence_n, device=dev, dtype=dt))
+        # Fade-in on the head of every chunk except the first
+        if idx > 0:
+            fin_n = min(fade_n, piece.size(-1))
+            if fin_n > 0:
+                w_in = torch.linspace(0, 1, fin_n, device=dev, dtype=dt)[None, :]
+                piece[..., :fin_n] = piece[..., :fin_n] * w_in
 
-        # Fade in head of next chunk
-        fade_in = chunk.clone()
-        fin_n = min(fade_n, fade_in.size(-1))
-        if fin_n > 0:
-            w_in = torch.linspace(0, 1, fin_n, device=dev, dtype=dt)[None, :]
-            fade_in[..., :fin_n] = fade_in[..., :fin_n] * w_in
+        parts.append(piece)
 
-        parts.append(fade_in)
-        merged = torch.cat(parts, dim=-1)
+        # Silence gap after every chunk except the last
+        if idx < len(chunks) - 1:
+            parts.append(
+                torch.zeros(chunk.shape[0], silence_n, device=dev, dtype=dt)
+            )
 
-    return merged
+    return torch.cat(parts, dim=-1)

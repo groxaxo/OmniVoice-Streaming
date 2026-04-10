@@ -39,7 +39,7 @@ import signal
 import time
 import traceback
 from collections import OrderedDict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from typing import List, Optional, Tuple
 
@@ -61,6 +61,11 @@ SAMPLING_RATE = 24000
 # Each worker is an independent subprocess, so this dict is process-local.
 _worker_prompt_cache: OrderedDict = OrderedDict()
 _WORKER_PROMPT_CACHE_MAXSIZE = 128
+
+# Per-worker thread pool for async file saves.
+# Saves multiple output waveforms in parallel so the GPU worker is not blocked
+# by sequential disk I/O after synthesis completes.
+_save_pool: Optional[ThreadPoolExecutor] = None
 
 
 @lru_cache(maxsize=4096)
@@ -246,7 +251,7 @@ def process_init(rank_queue, model_checkpoint, warmup=0):
     Loads model (with tokenizers and duration estimator) onto a specific GPU
     via ``OmniVoice.from_pretrained()``.
     """
-    global worker_model
+    global worker_model, _save_pool
 
     torch.set_num_threads(2)
     torch.set_num_interop_threads(2)
@@ -272,6 +277,10 @@ def process_init(rank_queue, model_checkpoint, warmup=0):
         model_checkpoint,
         device_map=worker_device,
     )
+
+    # Thread pool for async file saves: multiple waveforms per batch can be
+    # written to disk in parallel, keeping GPU-bound workers unblocked.
+    _save_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ov-save")
 
     if warmup > 0:
         logging.info(f"Running {warmup} warmup iterations on {worker_device}")
@@ -438,10 +447,20 @@ def run_inference_batch(
     batch_synth_time = time.time() - start_time
 
     results = []
+    save_futures = []
     for save_name, audio in zip(save_names, audios):
         save_path = os.path.join(res_dir, save_name + ".wav")
-        torchaudio.save(save_path, audio, worker_model.sampling_rate)
-        audio_duration = audio.shape[-1] / worker_model.sampling_rate
+        audio_cpu = audio.cpu()
+        sr = worker_model.sampling_rate
+        audio_duration = audio_cpu.shape[-1] / sr
+        if _save_pool is not None:
+            # Submit save to thread pool so multiple files in the batch are
+            # written concurrently rather than sequentially.
+            save_futures.append(
+                _save_pool.submit(torchaudio.save, save_path, audio_cpu, sr)
+            )
+        else:
+            torchaudio.save(save_path, audio_cpu, sr)
         results.append(
             (
                 save_name,
@@ -450,6 +469,10 @@ def run_inference_batch(
                 "success",
             )
         )
+
+    # Wait for all pending saves so callers can rely on files being on disk.
+    for fut in save_futures:
+        fut.result()
 
     return results
 
