@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections import OrderedDict
 from html import escape
 import logging
 import math
@@ -883,6 +884,39 @@ class PreparedSpeechRequest:
     generation_config: OmniVoiceGenerationConfig
 
 
+class _VoicePromptLRUCache:
+    """Bounded LRU cache for ``VoiceClonePrompt`` objects.
+
+    Each cached entry may hold GPU tensors, so unconstrained growth would
+    exhaust device memory when serving many distinct voices.  The default cap
+    of 128 entries is large enough for typical deployments while preventing
+    unbounded accumulation.
+    """
+
+    def __init__(self, maxsize: int = 128) -> None:
+        self._maxsize = max(1, maxsize)
+        self._store: OrderedDict[str, object] = OrderedDict()
+
+    def get(self, key: str) -> object:
+        if key not in self._store:
+            return None
+        self._store.move_to_end(key)
+        return self._store[key]
+
+    def __setitem__(self, key: str, value: object) -> None:
+        if key in self._store:
+            self._store.move_to_end(key)
+        self._store[key] = value
+        while len(self._store) > self._maxsize:
+            self._store.popitem(last=False)
+
+    def clear(self) -> None:
+        self._store.clear()
+
+    def __len__(self) -> int:
+        return len(self._store)
+
+
 class OmniVoiceService:
     def __init__(self, model_id: str, device: str, idle_timeout: float = 300.0) -> None:
         self.model_id = model_id
@@ -893,7 +927,7 @@ class OmniVoiceService:
         self._idle_timeout = idle_timeout
         self._idle_task: asyncio.Task | None = None
         self._last_used: float = 0.0
-        self._voice_prompt_cache: dict[str, object] = {}
+        self._voice_prompt_cache: _VoicePromptLRUCache = _VoicePromptLRUCache(maxsize=128)
 
     def set_lock(self, lock: asyncio.Lock) -> None:
         self.load_lock = lock

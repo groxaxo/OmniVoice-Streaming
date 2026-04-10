@@ -1295,15 +1295,17 @@ class OmniVoice(PreTrainedModel):
                     sample_tokens != self.config.audio_mask_id, -float("inf")
                 )
 
-                _, topk_idx = torch.topk(scores.flatten(), k)
-                flat_tokens = sample_tokens.flatten()
-                flat_tokens[topk_idx] = pred_tokens.flatten()[topk_idx]
-                sample_tokens.copy_(flat_tokens.view_as(sample_tokens))
+                # Identify the top-k positions and write predicted tokens directly
+                # into `tokens` using unraveled multi-dim indices, avoiding
+                # intermediate flatten copies and a redundant copy_ call.
+                _, topk_flat = scores.view(-1).topk(k)
+                c_idx = torch.div(topk_flat, t_len, rounding_mode="trunc")
+                t_idx = topk_flat % t_len
+                tokens[i, c_idx, t_idx] = pred_tokens[0, c_idx, t_idx]
 
-                # Update individual slices into batched structure
-                tokens[i : i + 1, :, :t_len] = sample_tokens
-                batch_input_ids[i : i + 1, :, c_len - t_len : c_len] = sample_tokens
-                batch_input_ids[B + i : B + i + 1, :, :t_len] = sample_tokens
+                # Propagate the updated token slice into the batched input tensor.
+                batch_input_ids[i, :, c_len - t_len : c_len] = tokens[i, :, :t_len]
+                batch_input_ids[B + i, :, :t_len] = tokens[i, :, :t_len]
 
         return [tokens[i, :, : task.target_lens[i]] for i in range(B)]
 
@@ -1331,10 +1333,11 @@ class OmniVoice(PreTrainedModel):
             pred_tokens = _gumbel_sample(
                 filtered_probs, gen_config.class_temperature
             ).argmax(dim=-1)
+            confidence_scores = log_probs.max(dim=-1)[0]
         else:
-            pred_tokens = log_probs.argmax(dim=-1)
-
-        confidence_scores = log_probs.max(dim=-1)[0]
+            # Single max() call returns both values (scores) and indices (pred_tokens),
+            # avoiding a redundant argmax pass over the vocab dimension.
+            confidence_scores, pred_tokens = log_probs.max(dim=-1)
 
         return pred_tokens, confidence_scores
 
@@ -1368,19 +1371,12 @@ def _build_block_mask_document_ids(
     so they only attend to themselves, matching the old diagonal-only padding
     behavior without materializing a dense quadratic mask.
     """
-    document_ids = torch.empty(
-        (len(lengths), max_seq_len), dtype=torch.int32, device=device
-    )
-    for row, seq_len in enumerate(lengths):
-        document_ids[row, :seq_len] = 0
-        if seq_len < max_seq_len:
-            document_ids[row, seq_len:] = -torch.arange(
-                1,
-                max_seq_len - seq_len + 1,
-                dtype=torch.int32,
-                device=device,
-            )
-    return document_ids
+    lengths_t = torch.tensor(lengths, dtype=torch.long, device=device)  # (B,)
+    pos = torch.arange(max_seq_len, device=device)                       # (S,)
+    is_pad = pos.unsqueeze(0) >= lengths_t.unsqueeze(1)                  # (B, S)
+    # Padding positions get unique negative ids: -(pos - length + 1)
+    pad_ids = (lengths_t.unsqueeze(1) - pos.unsqueeze(0) - 1).to(torch.int32)
+    return torch.where(is_pad, pad_ids, torch.zeros_like(pad_ids))
 
 
 def _resolve_language(language: Optional[str]) -> Union[str, None]:

@@ -147,3 +147,8 @@ def configure_cuda_inference(device: Any) -> None:
         return
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+    # Let cuDNN benchmark available convolution algorithms and cache the fastest
+    # one for each input shape.  First call with a new shape is slower, but
+    # every subsequent call with the same shape benefits.  Critical for the
+    # audio tokenizer which has fixed-size convolutional layers.
+    torch.backends.cudnn.benchmark = True
