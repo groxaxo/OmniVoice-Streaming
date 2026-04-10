@@ -1,7 +1,7 @@
-# OmniVoice 🌍
+# OmniVoice Streaming 🌍
 
 <p align="center">
-  <img width="200" height="200" alt="OmniVoice" src="https://zhu-han.github.io/omnivoice/pics/omnivoice.jpg" />
+  <img width="100%" alt="OmniVoice Streaming banner" src="assets/omnivoice-streaming-banner.svg" />
 </p>
 
 <p align="center">
@@ -14,9 +14,16 @@
   <a href="https://zhu-han.github.io/omnivoice"><img src="https://img.shields.io/badge/GitHub.io-Demo_Page-blue?logo=GitHub&style=flat-square"></a>
 </p>
 
-OmniVoice is a state-of-the-art massively multilingual zero-shot text-to-speech (TTS) model supporting over 600 languages. Built on a novel diffusion language model-style architecture, it generates high-quality speech with superior inference speed, supporting voice cloning and voice design.
+OmniVoice Streaming is a maintained fork of the original [OmniVoice](https://github.com/k2-fsa/OmniVoice) project by Zhu Han and contributors. Thanks to the original OmniVoice creators for the base model, research, and pretrained checkpoints; this repo focuses on production hardening, server ergonomics, and fix-forward improvements around the original project.
 
-**Contents**: [Key Features](#key-features) | [Installation](#installation) | [Quick Start](#quick-start) | [Python API](#python-api) | [Command-Line Tools](#command-line-tools) | [Training & Evaluation](#training--evaluation) | [Discussion](#discussion--communication) | [Citation](#citation)
+**Contents**: [Fork Highlights](#fork-highlights) | [Key Features](#key-features) | [Installation](#installation) | [Quick Start](#quick-start) | [Python API](#python-api) | [Command-Line Tools](#command-line-tools) | [Training & Evaluation](#training--evaluation) | [Discussion](#discussion--communication) | [Citation](#citation)
+
+## Fork Highlights
+
+- **Inference stability**: fixed the batched decoding mask regression that could produce gibberish outputs in CFG inference.
+- **Server defaults**: the OpenAI-compatible TTS server now keeps the upstream OmniVoice generation parameters intact unless you override them.
+- **Operational polish**: added clearer server docs, regression coverage, and transcription-based validation for English and Spanish audio.
+- **Upstream credit**: thanks to the original OmniVoice creators; this fork keeps that attribution front and center.
 
 ## Key Features
 

@@ -1,0 +1,54 @@
+<svg width="1600" height="420" viewBox="0 0 1600 420" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">OmniVoice Streaming</title>
+  <desc id="desc">A maintained OmniVoice fork with production fixes, server upgrades, and stable TTS delivery.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1600" y2="420" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#07111f" />
+      <stop offset="0.52" stop-color="#0e2340" />
+      <stop offset="1" stop-color="#0f766e" />
+    </linearGradient>
+    <radialGradient id="glowBlue" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(1260 110) rotate(90) scale(190)">
+      <stop stop-color="#38bdf8" stop-opacity="0.45" />
+      <stop offset="1" stop-color="#38bdf8" stop-opacity="0" />
+    </radialGradient>
+    <radialGradient id="glowGreen" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(1160 300) rotate(90) scale(230)">
+      <stop stop-color="#34d399" stop-opacity="0.22" />
+      <stop offset="1" stop-color="#34d399" stop-opacity="0" />
+    </radialGradient>
+    <filter id="softShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="18" stdDeviation="22" flood-color="#020617" flood-opacity="0.35" />
+    </filter>
+  </defs>
+
+  <rect width="1600" height="420" rx="36" fill="url(#bg)" />
+  <circle cx="1270" cy="110" r="190" fill="url(#glowBlue)" />
+  <circle cx="1175" cy="300" r="230" fill="url(#glowGreen)" />
+
+  <g opacity="0.18">
+    <path d="M980 245C1044 210 1110 210 1174 245C1238 280 1304 280 1368 245C1432 210 1498 210 1562 245" stroke="#93c5fd" stroke-width="8" stroke-linecap="round" />
+    <path d="M980 278C1044 243 1110 243 1174 278C1238 313 1304 313 1368 278C1432 243 1498 243 1562 278" stroke="#67e8f9" stroke-width="8" stroke-linecap="round" />
+    <path d="M980 311C1044 276 1110 276 1174 311C1238 346 1304 346 1368 311C1432 276 1498 276 1562 311" stroke="#34d399" stroke-width="8" stroke-linecap="round" />
+  </g>
+
+  <g filter="url(#softShadow)">
+    <rect x="88" y="80" width="146" height="146" rx="34" fill="#0b1220" fill-opacity="0.78" stroke="#7dd3fc" stroke-opacity="0.45" />
+    <path d="M118 150C136 126 157 114 181 114C198 114 211 120 221 131C231 142 236 155 236 171C236 188 231 201 221 212C211 223 198 229 181 229C157 229 136 217 118 193V150Z" fill="none" stroke="#e0f2fe" stroke-width="10" stroke-linecap="round" stroke-linejoin="round" />
+    <path d="M118 126L118 217" stroke="#38bdf8" stroke-width="8" stroke-linecap="round" />
+    <circle cx="181" cy="171" r="12" fill="#34d399" />
+  </g>
+
+  <text x="284" y="156" fill="#f8fafc" font-size="74" font-weight="800" font-family="Inter, Segoe UI, Arial, sans-serif">OmniVoice Streaming</text>
+  <text x="284" y="214" fill="#dbeafe" font-size="28" font-weight="500" font-family="Inter, Segoe UI, Arial, sans-serif">Original OmniVoice, upgraded for stable TTS delivery</text>
+  <text x="284" y="262" fill="#bfdbfe" font-size="22" font-weight="500" font-family="Inter, Segoe UI, Arial, sans-serif">OpenAI-compatible server | batched inference fix | transcription-backed checks</text>
+
+  <g font-family="Inter, Segoe UI, Arial, sans-serif" font-size="18" font-weight="700">
+    <rect x="284" y="296" width="156" height="42" rx="21" fill="#0f172a" fill-opacity="0.75" stroke="#38bdf8" stroke-opacity="0.4" />
+    <text x="362" y="323" fill="#e0f2fe" text-anchor="middle">Upstream credit</text>
+
+    <rect x="454" y="296" width="164" height="42" rx="21" fill="#0f172a" fill-opacity="0.75" stroke="#34d399" stroke-opacity="0.45" />
+    <text x="536" y="323" fill="#dcfce7" text-anchor="middle">Production fixes</text>
+
+    <rect x="632" y="296" width="198" height="42" rx="21" fill="#0f172a" fill-opacity="0.75" stroke="#fbbf24" stroke-opacity="0.45" />
+    <text x="731" y="323" fill="#fef3c7" text-anchor="middle">Whisper verified</text>
+  </g>
+</svg>
