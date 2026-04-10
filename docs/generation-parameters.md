@@ -64,3 +64,10 @@ To support stable long-form speech generation with low VRAM consumption, the tex
 |---|---|---|---|
 | `audio_chunk_duration` | float | 15.0 | Target chunk duration (seconds) when splitting long text. |
 | `audio_chunk_threshold` | float | 30.0 | Estimated audio duration (seconds) above which chunking is activated. |
+
+## Inference stability
+
+The batched decoding path keeps padding positions self-attending instead of leaving
+them fully masked. If you change the inference mask or batching logic, preserve that
+behavior so the runtime stays aligned with the upstream model and avoids degraded
+audio output.

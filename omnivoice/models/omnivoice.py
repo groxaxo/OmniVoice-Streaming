@@ -1226,16 +1226,12 @@ class OmniVoice(PreTrainedModel):
         batch_audio_mask = torch.zeros(
             (2 * B, max_c_len), dtype=torch.bool, device=self.device
         )
-        # Build a 2D padding mask [2*B, max_c_len]: 1 for real tokens, 0 for padding.
-        # This is equivalent to the old flex_attention BlockMask (real tokens share
-        # doc_id=0 and attend to each other; padding positions are excluded).
-        # Using a plain tensor avoids the Triton kernel that exceeds the RTX 3060's
-        # shared-memory budget.
-        all_lens = torch.tensor(
-            c_lens + list(task.target_lens), dtype=torch.long, device=self.device
+        batch_attention_mask = _build_inference_attention_mask(
+            c_lens=c_lens,
+            target_lens=task.target_lens,
+            max_seq_len=max_c_len,
+            device=self.device,
         )
-        pos = torch.arange(max_c_len, device=self.device)
-        batch_attention_mask = (pos.unsqueeze(0) < all_lens.unsqueeze(1)).long()
 
         for i, inp in enumerate(inputs_list):
             c_len, u_len = c_lens[i], task.target_lens[i]
@@ -1379,6 +1375,35 @@ def _mask_mod_packed(document_ids, b, h, q_idx, kv_idx):
     else:
         same_doc = document_ids[b, q_idx] == document_ids[b, kv_idx]
     return same_doc
+
+
+def _build_inference_attention_mask(
+    c_lens: List[int],
+    target_lens: List[int],
+    max_seq_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build the dense attention mask used by batched iterative inference.
+
+    Padding queries must keep a valid self-attention path; otherwise all-masked rows
+    can destabilize decoding. Each padded position therefore attends only to itself.
+    """
+
+    batch_size = len(c_lens)
+    mask = torch.zeros(
+        (2 * batch_size, 1, max_seq_len, max_seq_len),
+        dtype=torch.bool,
+        device=device,
+    )
+
+    for index, (c_len, target_len) in enumerate(zip(c_lens, target_lens)):
+        for row_index, active_len in ((index, c_len), (batch_size + index, target_len)):
+            mask[row_index, :, :active_len, :active_len] = True
+            if active_len < max_seq_len:
+                pad_diag = torch.arange(active_len, max_seq_len, device=device)
+                mask[row_index, :, pad_diag, pad_diag] = True
+
+    return mask
 
 
 def _build_block_mask_document_ids(

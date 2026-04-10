@@ -3,7 +3,11 @@ from unittest.mock import patch
 
 import torch
 
-from omnivoice.models.omnivoice import _build_block_mask_document_ids, _mask_mod_packed
+from omnivoice.models.omnivoice import (
+    _build_block_mask_document_ids,
+    _build_inference_attention_mask,
+    _mask_mod_packed,
+)
 from omnivoice.utils.common import configure_cuda_inference, resolve_inference_dtype
 
 
@@ -63,6 +67,26 @@ class InferenceRuntimeTests(unittest.TestCase):
                 )
                 expected = torch.tensor(expected_rows, dtype=torch.int32)
                 self.assertTrue(torch.equal(result, expected))
+
+    def test_build_inference_attention_mask_keeps_padding_self_only(self) -> None:
+        mask = _build_inference_attention_mask(
+            c_lens=[5],
+            target_lens=[3],
+            max_seq_len=5,
+            device=torch.device("cpu"),
+        )
+
+        self.assertEqual(mask.shape, (2, 1, 5, 5))
+
+        cond = mask[0, 0]
+        uncond = mask[1, 0]
+
+        self.assertTrue(torch.all(cond[:5, :5]))
+        self.assertTrue(torch.all(uncond[:3, :3]))
+        self.assertFalse(uncond[3, :3].any())
+        self.assertFalse(uncond[4, :4].any())
+        self.assertTrue(uncond[3, 3])
+        self.assertTrue(uncond[4, 4])
 
     def test_combined_max_argmax_matches_separate_calls(self) -> None:
         """log_probs.max(dim=-1) must return the same values as separate max/argmax."""
