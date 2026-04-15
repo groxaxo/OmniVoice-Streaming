@@ -109,6 +109,16 @@ Try OmniVoice without coding:
 
 > If you have trouble connecting to HuggingFace when downloading the pre-trained models, set `export HF_ENDPOINT="https://hf-mirror.com"` before running.
 
+### GPU pool mode for shared machines
+
+This fork also includes a GPU-aware router plus a Celery worker spawner for hosts where OmniVoice must stay on specific cards instead of grabbing any visible CUDA device. Configure the target GPU UUIDs in `deploy/systemd/omnivoice-pool.env`, then install the user services with:
+
+```bash
+./scripts/install_omnivoice_user_services.sh
+```
+
+That stack keeps the public API on port `6655`, starts internal OmniVoice workers on per-GPU ports beginning at `6656`, and only expands to a second worker when another configured GPU has enough free VRAM.
+
 For full usage, see the [Python API](#python-api) and [Command-Line Tools](#command-line-tools) sections below.
 
 ---
@@ -285,7 +295,17 @@ Only `id` and `text` are mandatory fields. `ref_audio` and `ref_text` are used i
 omnivoice-openai-tts-server --host 0.0.0.0 --port 6655
 ```
 
-The server exposes `/v1/audio/speech`, `/v1/audio/voices`, `/v1/audio/models`, and `/health` endpoints. Incoming text is sanitized before synthesis (control-token stripping, whitespace cleanup, optional URL/email/phone normalization), and longer inputs are chunked on sentence punctuation before the final audio is returned as one response.
+The server exposes `/v1/audio/speech`, `/v1/audio/transcriptions`, `/v1/audio/translations`, `/v1/audio/voices`, `/v1/audio/models`, and `/health` endpoints. Incoming text is sanitized before synthesis through a multi-stage pipeline:
+
+1. **LLM artifact removal** — strips `<think>`, `<thinking>`, `<reasoning>`, and `<reflection>` blocks (tag + content) so internal LLM reasoning is never spoken
+2. **Markdown stripping** — removes fenced/inline code blocks, headings, bold/italic/strikethrough markers, blockquotes, list bullets, links, images, and table separators (keeping readable text)
+3. **HTML tag stripping** — removes remaining HTML/XML tags
+4. **Model control token removal** — strips `<|...|>` tokens
+5. **Normalization** — Unicode NFKC, smart-quote normalization, CJK punctuation, URL/email/phone expansion, number/money/unit spoken-form conversion, symbol replacement, whitespace collapse
+
+Longer inputs are chunked on sentence punctuation before synthesis and the chunks are merged into one audio response. The transcription routes accept OpenAI-style multipart uploads (`file`, `model`, `language`, `prompt`, `response_format`) so Open WebUI can target the same base URL for TTS and STT.
+
+The server binds to `0.0.0.0` by default (`OMNIVOICE_HOST` or `--host`). For Open WebUI, keep the OmniVoice server listening on `0.0.0.0`, but configure the Open WebUI base URL with a reachable hostname or IP such as `http://127.0.0.1:6655/v1`, `http://192.168.x.x:6655/v1`, or `http://host.docker.internal:6655/v1` rather than `http://0.0.0.0:6655/v1`.
 
 The `/ui` page provides a small browser-friendly credits and voice summary view.
 
@@ -299,6 +319,11 @@ curl -X POST http://127.0.0.1:6655/v1/audio/speech \
     "response_format": "mp3"
   }' \
   --output speech.mp3
+
+curl -X POST http://127.0.0.1:6655/v1/audio/transcriptions \
+  -F "file=@sample.wav" \
+  -F "model=whisper-1" \
+  -F "language=en"
 ```
 
 ---

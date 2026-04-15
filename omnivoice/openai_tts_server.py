@@ -11,8 +11,10 @@ import os
 import re
 import subprocess
 import io
+import tempfile
 import time
 import unicodedata
+import wave
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,13 +25,14 @@ import inflect
 import torch
 import torchaudio
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydub import AudioSegment
 
 from omnivoice import OmniVoice, OmniVoiceGenerationConfig
-from omnivoice.utils.common import get_best_device
+from omnivoice.utils.common import get_best_device, resolve_inference_dtype
 from omnivoice.utils.text import add_punctuation, chunk_text_punctuation
 
 
@@ -47,6 +50,9 @@ DEFAULT_AUDIO_CHUNK_THRESHOLD = float(
 )
 DEFAULT_SENTENCE_CHUNKING_MIN_CHARS = int(
     os.getenv("OMNIVOICE_SENTENCE_CHUNKING_MIN_CHARS", "280")
+)
+DEFAULT_ASR_MODEL_ID = os.getenv(
+    "OMNIVOICE_ASR_MODEL_ID", "openai/whisper-large-v3-turbo"
 )
 MAX_SANITIZED_INPUT_CHARS = int(os.getenv("OMNIVOICE_MAX_INPUT_CHARS", "12000"))
 MAX_RAW_INPUT_CHARS = int(
@@ -208,6 +214,29 @@ CJK_PUNCTUATION_TRANSLATION = str.maketrans(
 CONTROL_CHAR_PATTERN = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
 MODEL_CONTROL_TOKEN_PATTERN = re.compile(r"<\|[^<>|\r\n]{1,128}\|>")
 HTML_TAG_PATTERN = re.compile(r"</?[^>\r\n]{1,256}>")
+
+# LLM reasoning/thinking block patterns — strip tag + content entirely
+_THINK_RE = re.compile(
+    r"<(think|thinking|reasoning|reflection)>.*?</\1>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+# Markdown patterns for stripping
+_MD_CODE_BLOCK_RE = re.compile(r"```[\s\S]*?```", re.DOTALL)
+_MD_INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
+_MD_HEADING_RE = re.compile(r"^#{1,6}\s+(.+)$", re.MULTILINE)
+_MD_HORIZ_RULE_RE = re.compile(r"^[ \t]*(?:[-*_][ \t]*){3,}$", re.MULTILINE)
+_MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*|__(.+?)__", re.DOTALL)
+_MD_ITALIC_RE = re.compile(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)|(?<!_)_(?!_)(.+?)(?<!_)_(?!_)")
+_MD_STRIKE_RE = re.compile(r"~~(.+?)~~", re.DOTALL)
+_MD_BLOCKQUOTE_RE = re.compile(r"^[ \t]*>[ \t]?(.*)$", re.MULTILINE)
+_MD_UNORDERED_LIST_RE = re.compile(r"^[ \t]*[-*+][ \t]+", re.MULTILINE)
+_MD_ORDERED_LIST_RE = re.compile(r"^[ \t]*\d+\.[ \t]+", re.MULTILINE)
+_MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]*\)")
+_MD_TABLE_SEP_RE = re.compile(r"^\|?[ \t]*[-:]+[-| :\t]*\|?\s*$", re.MULTILINE)
+_MD_TABLE_PIPE_RE = re.compile(r"\|")
+
 URL_PATTERN = re.compile(
     r"(https?://|www\.|)+(localhost|[a-zA-Z0-9.-]+(\.(?:"
     + "|".join(VALID_TLDS)
@@ -265,6 +294,7 @@ SYMBOL_REPLACEMENTS = {
     "<": " less than ",
     ">": " greater than ",
 }
+
 
 @dataclass(frozen=True, slots=True)
 class VoiceOptionDefinition:
@@ -430,14 +460,26 @@ VOICE_OPTIONS: list[VoiceOptionDefinition] = [
         id="argentina_voice",
         fallback_name="argentina_voice (female, warm pitch, argentinian accent)",
         fallback_instruct="female, warm pitch, argentinian accent",
-        sample_file="omnivoice_refs/testargentina_8s.wav",
+        sample_file="speaker_5679x1_8886x1_endstrimmed_13s.wav",
         sample_ref_text=(
-            "Definitivamente el departamento tiene que tener terraza o balcon. "
-            "Hace mucho tiempo que tenia ganas de usar esta aplicacion para aprender a cocinar."
+            "El otro dia vi un video en Facebook sobre un aparatito que te ponías en la "
+            "oreja y directamente te traducía, ¿eso existe? Casablanca es la película "
+            "favorita de personas nacidas entre mil novecientos ochenta y mil novecientos "
+            "ochenta y cinco."
         ),
-        sample_label="Argentina Voice",
-        sample_duration_seconds=8.0,
+        sample_label="Speakers 5679+8886 (ends-trimmed, internal silence preserved)",
+        sample_duration_seconds=12.9,
         default_language="es",
+    ),
+    VoiceOptionDefinition(
+        id="mergy",
+        fallback_name="mergy (female, Welsh base + British instruct bias)",
+        fallback_instruct="female, young adult, moderate pitch, british accent",
+        sample_file="downloads_audio_clean.wav",
+        sample_ref_text="Julian drew on the Jewish equation of divinity and law.",
+        sample_label="Welsh female base (downloads/audio.wav cleaned)",
+        sample_duration_seconds=4.1,
+        default_language="en",
     ),
     VoiceOptionDefinition(
         id="auto",
@@ -466,6 +508,19 @@ SUPPORTED_RESPONSE_FORMATS = {
     "ogg": ("audio/ogg", "ogg"),
     "opus": ("audio/opus", "opus"),
 }
+SUPPORTED_TRANSCRIPTION_RESPONSE_FORMATS = {
+    "json",
+    "text",
+    "srt",
+    "verbose_json",
+    "vtt",
+}
+SUPPORTED_TRANSCRIPTION_MODEL_ALIASES = {
+    DEFAULT_ASR_MODEL_ID,
+    "whisper-1",
+    "gpt-4o-transcribe",
+    "gpt-4o-mini-transcribe",
+}
 
 
 def _build_frontend_page() -> str:
@@ -477,14 +532,20 @@ def _build_frontend_page() -> str:
         if has_local_sample:
             local_voice_count += 1
 
-        source_label = "Local reference clip" if has_local_sample else "Voice design prompt"
+        source_label = (
+            "Local reference clip" if has_local_sample else "Voice design prompt"
+        )
         duration_label = (
             f"{int(round(option.sample_duration_seconds))}s clip"
             if option.sample_duration_seconds is not None
             else "No reference clip"
         )
         language_label = option.default_language or "auto"
-        detail_text = option.sample_ref_text or option.fallback_instruct or "Automatic voice selection"
+        detail_text = (
+            option.sample_ref_text
+            or option.fallback_instruct
+            or "Automatic voice selection"
+        )
 
         voice_cards.append(
             f"""
@@ -800,6 +861,8 @@ def _configure_logging() -> None:
 
 
 DEFAULT_DEVICE = get_best_device()
+DEFAULT_ASR_DEVICE = os.getenv("OMNIVOICE_ASR_DEVICE", "cpu")
+DEFAULT_ASR_IDLE_TIMEOUT = float(os.getenv("OMNIVOICE_ASR_IDLE_TIMEOUT", "300"))
 
 
 class TextSanitizationOptions(BaseModel):
@@ -927,7 +990,9 @@ class OmniVoiceService:
         self._idle_timeout = idle_timeout
         self._idle_task: asyncio.Task | None = None
         self._last_used: float = 0.0
-        self._voice_prompt_cache: _VoicePromptLRUCache = _VoicePromptLRUCache(maxsize=128)
+        self._voice_prompt_cache: _VoicePromptLRUCache = _VoicePromptLRUCache(
+            maxsize=128
+        )
 
     def set_lock(self, lock: asyncio.Lock) -> None:
         self.load_lock = lock
@@ -1068,6 +1133,164 @@ class OmniVoiceService:
         return prompt
 
 
+class ASRService:
+    def __init__(self, model_id: str, device: str, idle_timeout: float = 300.0) -> None:
+        self.model_id = model_id
+        self.device = device
+        self.pipeline = None
+        self.load_error: str | None = None
+        self.load_lock: asyncio.Lock | None = None
+        self._idle_timeout = idle_timeout
+        self._idle_task: asyncio.Task | None = None
+        self._last_used: float = 0.0
+
+    def set_lock(self, lock: asyncio.Lock) -> None:
+        self.load_lock = lock
+
+    def _touch(self) -> None:
+        self._last_used = time.monotonic()
+        self._schedule_idle_offload()
+
+    def _schedule_idle_offload(self) -> None:
+        if self._idle_task is not None:
+            self._idle_task.cancel()
+        if self._idle_timeout > 0 and self.pipeline is not None:
+            self._idle_task = asyncio.get_event_loop().create_task(
+                self._idle_offload_loop()
+            )
+
+    async def _idle_offload_loop(self) -> None:
+        try:
+            while True:
+                elapsed = time.monotonic() - self._last_used
+                remaining = self._idle_timeout - elapsed
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(remaining)
+        except asyncio.CancelledError:
+            return
+
+        if self.pipeline is not None:
+            LOG.info(
+                "Idle timeout (%.0fs) reached, offloading ASR model from %s",
+                self._idle_timeout,
+                self.device,
+            )
+            try:
+                await asyncio.to_thread(self._offload_pipeline_sync)
+                LOG.info("ASR model offloaded successfully")
+            except Exception:
+                LOG.exception("Failed to offload ASR model")
+
+    def _offload_pipeline_sync(self) -> None:
+        if self.pipeline is None:
+            return
+
+        import gc
+
+        del self.pipeline
+        self.pipeline = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _load_pipeline_sync(self):
+        from transformers import pipeline as hf_pipeline
+
+        LOG.info("Loading ASR model %s on %s", self.model_id, self.device)
+        pipe = hf_pipeline(
+            "automatic-speech-recognition",
+            model=self.model_id,
+            dtype=resolve_inference_dtype(self.device),
+            device_map=self.device,
+        )
+        LOG.info("ASR model loaded on %s", self.device)
+        return pipe
+
+    async def get_pipeline(self):
+        if self.pipeline is not None:
+            self._touch()
+            return self.pipeline
+        if self.load_lock is None:
+            raise RuntimeError("ASR load lock is not initialized")
+
+        async with self.load_lock:
+            if self.pipeline is not None:
+                self._touch()
+                return self.pipeline
+
+            try:
+                self.load_error = None
+                self.pipeline = await asyncio.to_thread(self._load_pipeline_sync)
+                self._touch()
+            except Exception as exc:
+                self.load_error = str(exc)
+                LOG.exception("Failed to load ASR model")
+                raise
+
+            return self.pipeline
+
+    async def transcribe_file(
+        self,
+        file_path: str,
+        *,
+        task: Literal["transcribe", "translate"],
+        language: Optional[str] = None,
+        prompt: Optional[str] = None,
+        temperature: Optional[float] = None,
+        return_timestamps: bool | str = False,
+    ) -> dict[str, object]:
+        pipe = await self.get_pipeline()
+        return await asyncio.to_thread(
+            self._transcribe_file_sync,
+            pipe,
+            file_path,
+            task,
+            language,
+            prompt,
+            temperature,
+            return_timestamps,
+        )
+
+    def _transcribe_file_sync(
+        self,
+        pipe,
+        file_path: str,
+        task: Literal["transcribe", "translate"],
+        language: Optional[str],
+        prompt: Optional[str],
+        temperature: Optional[float],
+        return_timestamps: bool | str,
+    ) -> dict[str, object]:
+        call_kwargs: dict[str, object] = {}
+        generate_kwargs: dict[str, object] = {"task": task}
+
+        if language:
+            generate_kwargs["language"] = language
+        if prompt:
+            generate_kwargs["prompt"] = prompt
+        if temperature is not None:
+            generate_kwargs["temperature"] = temperature
+        if generate_kwargs:
+            call_kwargs["generate_kwargs"] = generate_kwargs
+        if return_timestamps:
+            call_kwargs["return_timestamps"] = return_timestamps
+
+        result = pipe(file_path, **call_kwargs)
+        if isinstance(result, dict):
+            return result
+        return {"text": str(result).strip()}
+
+    def health(self) -> dict[str, object]:
+        return {
+            "asr_model_id": self.model_id,
+            "asr_device": self.device,
+            "asr_model_loaded": self.pipeline is not None,
+            "asr_load_error": self.load_error,
+            "asr_idle_timeout": self._idle_timeout,
+        }
+
+
 def _protect_bracket_tags(text: str) -> tuple[str, dict[str, str]]:
     protected: dict[str, str] = {}
 
@@ -1191,9 +1414,7 @@ def _normalize_grouped_phone(match: re.Match[str]) -> str:
             comma="",
         )
     )
-    parts.append(
-        INFLECT_ENGINE.number_to_words(telephone_prefix, group=1, comma="")
-    )
+    parts.append(INFLECT_ENGINE.number_to_words(telephone_prefix, group=1, comma=""))
     parts.append(INFLECT_ENGINE.number_to_words(line_number, group=1, comma=""))
     return ", ".join(filter(None, parts))
 
@@ -1296,9 +1517,7 @@ def _normalize_titles_and_abbreviations(text: str) -> str:
     return text
 
 
-def _normalize_english_like_text(
-    text: str, options: TextSanitizationOptions
-) -> str:
+def _normalize_english_like_text(text: str, options: TextSanitizationOptions) -> str:
     normalized = text
     if options.unit_normalization:
         normalized = UNIT_PATTERN.sub(_normalize_unit, normalized)
@@ -1319,6 +1538,39 @@ def _normalize_english_like_text(
         normalized = NUMBER_PATTERN.sub(_normalize_number, normalized)
 
     return normalized
+
+
+def _strip_llm_artifacts(text: str) -> str:
+    """Remove LLM reasoning/thinking blocks (tag + content) from text."""
+    return _THINK_RE.sub(" ", text)
+
+
+def _strip_markdown(text: str) -> str:
+    """Strip markdown formatting, keeping readable text content."""
+    # Remove fenced code blocks entirely
+    text = _MD_CODE_BLOCK_RE.sub(" ", text)
+    # Remove inline code
+    text = _MD_INLINE_CODE_RE.sub(" ", text)
+    # Convert headings to plain text
+    text = _MD_HEADING_RE.sub(r"\1", text)
+    # Remove horizontal rules
+    text = _MD_HORIZ_RULE_RE.sub(" ", text)
+    # Unwrap bold/italic/strikethrough, keeping the inner text
+    text = _MD_BOLD_RE.sub(lambda m: m.group(1) or m.group(2), text)
+    text = _MD_ITALIC_RE.sub(lambda m: m.group(1) or m.group(2) or "", text)
+    text = _MD_STRIKE_RE.sub(r"\1", text)
+    # Unwrap blockquotes
+    text = _MD_BLOCKQUOTE_RE.sub(r"\1", text)
+    # Remove list markers
+    text = _MD_UNORDERED_LIST_RE.sub("", text)
+    text = _MD_ORDERED_LIST_RE.sub("", text)
+    # Unwrap images (keep alt text), then links (keep link text)
+    text = _MD_IMAGE_RE.sub(r"\1", text)
+    text = _MD_LINK_RE.sub(r"\1", text)
+    # Remove table separator rows, then pipe characters
+    text = _MD_TABLE_SEP_RE.sub(" ", text)
+    text = _MD_TABLE_PIPE_RE.sub(" ", text)
+    return text
 
 
 def _basic_cleanup(
@@ -1350,6 +1602,9 @@ def sanitize_speech_text(
 ) -> str:
     if not text:
         return ""
+    # Strip LLM reasoning blocks and markdown before any other processing
+    text = _strip_llm_artifacts(text)
+    text = _strip_markdown(text)
     if not options.normalize:
         return add_punctuation(
             _basic_cleanup(
@@ -1451,6 +1706,280 @@ def _guess_request_source(request: Request) -> str:
     if user_agent:
         return user_agent[:80]
     return "unknown"
+
+
+def _resolve_transcription_model(requested: Optional[str]) -> str:
+    if not requested:
+        return asr_service.model_id
+    if (
+        requested in SUPPORTED_TRANSCRIPTION_MODEL_ALIASES
+        or requested == asr_service.model_id
+    ):
+        return asr_service.model_id
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"Unsupported transcription model '{requested}'. Supported aliases: "
+            f"{', '.join(sorted(SUPPORTED_TRANSCRIPTION_MODEL_ALIASES))}"
+        ),
+    )
+
+
+def _coalesce_timestamp_granularities(
+    timestamp_granularities: Optional[list[str]],
+    bracketed_timestamp_granularities: Optional[list[str]],
+) -> list[str]:
+    merged: list[str] = []
+    for value in (timestamp_granularities or []) + (
+        bracketed_timestamp_granularities or []
+    ):
+        normalized = value.strip().lower()
+        if not normalized:
+            continue
+        if normalized not in {"segment", "word"}:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "timestamp_granularities must only contain 'segment' or 'word'"
+                ),
+            )
+        if normalized not in merged:
+            merged.append(normalized)
+    return merged
+
+
+def _resolve_asr_return_timestamps(
+    response_format: str,
+    timestamp_granularities: list[str],
+) -> bool | str:
+    if "word" in timestamp_granularities:
+        return "word"
+    if (
+        response_format in {"verbose_json", "srt", "vtt"}
+        or "segment" in timestamp_granularities
+    ):
+        return True
+    return False
+
+
+def _audio_duration_seconds(file_path: str) -> float:
+    try:
+        return float(AudioSegment.from_file(file_path).duration_seconds)
+    except Exception:
+        return 0.0
+
+
+def _normalize_transcript_chunks(
+    raw_chunks: object,
+    duration_seconds: float,
+    text: str,
+) -> list[dict[str, object]]:
+    chunks = raw_chunks if isinstance(raw_chunks, list) else []
+    normalized: list[dict[str, object]] = []
+
+    for idx, chunk in enumerate(chunks):
+        if not isinstance(chunk, dict):
+            continue
+        timestamp = chunk.get("timestamp")
+        start = end = None
+        if isinstance(timestamp, (list, tuple)) and len(timestamp) == 2:
+            start = float(timestamp[0]) if timestamp[0] is not None else None
+            end = float(timestamp[1]) if timestamp[1] is not None else None
+        chunk_text = str(chunk.get("text") or "").strip()
+        normalized.append(
+            {
+                "id": idx,
+                "text": chunk_text,
+                "start": start,
+                "end": end,
+            }
+        )
+
+    if normalized or not text:
+        return normalized
+
+    return [
+        {
+            "id": 0,
+            "text": text,
+            "start": 0.0,
+            "end": duration_seconds or 0.0,
+        }
+    ]
+
+
+def _format_transcription_timestamp(seconds: Optional[float], *, vtt: bool) -> str:
+    total_ms = max(0, int(round((seconds or 0.0) * 1000)))
+    hours, remainder = divmod(total_ms, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    secs, millis = divmod(remainder, 1_000)
+    separator = "." if vtt else ","
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}{separator}{millis:03d}"
+
+
+def _render_subtitle_transcript(
+    chunks: list[dict[str, object]],
+    *,
+    vtt: bool,
+) -> str:
+    lines: list[str] = ["WEBVTT", ""] if vtt else []
+    for idx, chunk in enumerate(chunks, start=1):
+        start = _format_transcription_timestamp(chunk.get("start"), vtt=vtt)
+        end = _format_transcription_timestamp(chunk.get("end"), vtt=vtt)
+        text = str(chunk.get("text") or "").strip()
+        if not text:
+            continue
+        if not vtt:
+            lines.append(str(idx))
+        lines.append(f"{start} --> {end}")
+        lines.append(text)
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+
+def _format_transcription_response(
+    *,
+    task: Literal["transcribe", "translate"],
+    response_format: str,
+    raw_result: dict[str, object],
+    language: Optional[str],
+    duration_seconds: float,
+    timestamp_granularities: list[str],
+    temperature: Optional[float],
+) -> dict[str, object] | Response:
+    text = str(raw_result.get("text") or "").strip()
+    chunks = _normalize_transcript_chunks(
+        raw_result.get("chunks"), duration_seconds, text
+    )
+
+    if response_format == "text":
+        return Response(content=text, media_type="text/plain; charset=utf-8")
+
+    if response_format == "srt":
+        return Response(
+            content=_render_subtitle_transcript(chunks, vtt=False),
+            media_type="text/plain; charset=utf-8",
+        )
+
+    if response_format == "vtt":
+        return Response(
+            content=_render_subtitle_transcript(chunks, vtt=True),
+            media_type="text/vtt; charset=utf-8",
+        )
+
+    if response_format == "verbose_json":
+        words = []
+        if "word" in timestamp_granularities:
+            words = [
+                {
+                    "word": str(chunk.get("text") or "").strip(),
+                    "start": chunk.get("start"),
+                    "end": chunk.get("end"),
+                }
+                for chunk in chunks
+                if str(chunk.get("text") or "").strip()
+            ]
+        segments = [
+            {
+                "id": chunk["id"],
+                "seek": 0,
+                "start": chunk.get("start") if chunk.get("start") is not None else 0.0,
+                "end": chunk.get("end")
+                if chunk.get("end") is not None
+                else duration_seconds,
+                "text": str(chunk.get("text") or "").strip(),
+                "tokens": [],
+                "temperature": temperature if temperature is not None else 0.0,
+                "avg_logprob": 0.0,
+                "compression_ratio": 0.0,
+                "no_speech_prob": 0.0,
+            }
+            for chunk in chunks
+            if str(chunk.get("text") or "").strip()
+        ]
+        payload: dict[str, object] = {
+            "task": task,
+            "language": str(raw_result.get("language") or language or ""),
+            "duration": duration_seconds,
+            "text": text,
+            "segments": segments,
+        }
+        if words:
+            payload["words"] = words
+        return payload
+
+    return {"text": text}
+
+
+async def _handle_audio_transcription(
+    *,
+    task: Literal["transcribe", "translate"],
+    file: UploadFile,
+    model: Optional[str],
+    language: Optional[str],
+    prompt: Optional[str],
+    response_format: str,
+    temperature: Optional[float],
+    timestamp_granularities: Optional[list[str]],
+    bracketed_timestamp_granularities: Optional[list[str]],
+) -> dict[str, object] | Response:
+    _resolve_transcription_model(model)
+    timestamp_values = _coalesce_timestamp_granularities(
+        timestamp_granularities,
+        bracketed_timestamp_granularities,
+    )
+    if response_format not in SUPPORTED_TRANSCRIPTION_RESPONSE_FORMATS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported response_format '{response_format}'. Supported values: "
+                f"{', '.join(sorted(SUPPORTED_TRANSCRIPTION_RESPONSE_FORMATS))}"
+            ),
+        )
+
+    suffix = Path(file.filename or "audio.bin").suffix or ".bin"
+    prompt_text = sanitize_prompt_text(prompt)
+    uploaded = await file.read()
+    if not uploaded:
+        raise HTTPException(status_code=400, detail="Uploaded audio file is empty")
+
+    temp_path: Optional[str] = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(uploaded)
+            temp_path = tmp.name
+
+        raw_result = await asr_service.transcribe_file(
+            temp_path,
+            task=task,
+            language=language,
+            prompt=prompt_text,
+            temperature=temperature,
+            return_timestamps=_resolve_asr_return_timestamps(
+                response_format,
+                timestamp_values,
+            ),
+        )
+        return _format_transcription_response(
+            task=task,
+            response_format=response_format,
+            raw_result=raw_result,
+            language=language,
+            duration_seconds=_audio_duration_seconds(temp_path),
+            timestamp_granularities=timestamp_values,
+            temperature=temperature,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        LOG.exception("Audio %s failed", task)
+        raise HTTPException(status_code=500, detail=f"Audio {task} failed") from exc
+    finally:
+        if temp_path is not None:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
 
 
 def _resolve_model(requested: Optional[str]) -> str:
@@ -1571,7 +2100,9 @@ def _prepare_request(payload: SpeechRequest) -> PreparedSpeechRequest:
         voice_id=resolved_voice.voice_id,
         voice_display_name=resolved_voice.display_name,
         voice_ref_audio_path=resolved_voice.ref_audio_path,
-        voice_ref_text=resolved_ref_text if resolved_voice.ref_audio_path is not None else None,
+        voice_ref_text=resolved_ref_text
+        if resolved_voice.ref_audio_path is not None
+        else None,
         chunk_plan=chunk_plan,
         force_sentence_chunking=force_sentence_chunking,
         generation_config=OmniVoiceGenerationConfig.from_dict(generation_config_kwargs),
@@ -1590,9 +2121,21 @@ def _waveform_to_bytes(
 
     waveform = waveform.detach().cpu().float().clamp(-1.0, 1.0).contiguous()
 
-    # Encode WAV entirely in memory — no temp files needed.
+    # torchaudio 2.9 routes file-like writes through torchcodec, which fails for
+    # in-memory BytesIO WAV output in this environment. Write canonical PCM WAV
+    # bytes ourselves, then feed those bytes to ffmpeg for compressed formats.
+    pcm_waveform = (waveform * 32767.0).round().to(torch.int16).contiguous()
+    if pcm_waveform.shape[0] == 1:
+        pcm_bytes = pcm_waveform.squeeze(0).numpy().tobytes()
+    else:
+        pcm_bytes = pcm_waveform.transpose(0, 1).contiguous().numpy().tobytes()
+
     wav_buffer = io.BytesIO()
-    torchaudio.save(wav_buffer, waveform, sample_rate, format="wav")
+    with wave.open(wav_buffer, "wb") as wav_file:
+        wav_file.setnchannels(int(pcm_waveform.shape[0]))
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm_bytes)
     wav_bytes = wav_buffer.getvalue()
 
     if response_format == "wav":
@@ -1618,8 +2161,10 @@ def _waveform_to_bytes(
         "-y",
         "-loglevel",
         "error",
-        "-f", "wav",
-        "-i", "pipe:0",   # read WAV from stdin
+        "-f",
+        "wav",
+        "-i",
+        "pipe:0",  # read WAV from stdin
     ]
 
     if response_format == "mp3":
@@ -1680,20 +2225,24 @@ async def _synthesize_prepared(
         len(prepared.text),
         len(prepared.chunk_plan),
         prepared.force_sentence_chunking,
-        "local-reference" if prepared.voice_ref_audio_path is not None else "style-prompt",
+        "local-reference"
+        if prepared.voice_ref_audio_path is not None
+        else "style-prompt",
     )
     LOG.debug("Sanitized input preview: %s", prepared.text[:200])
 
     def _run_generation() -> tuple[bytes, str]:
         generation_args = dict(generation_kwargs)
         if prepared.voice_ref_audio_path is not None:
-            generation_args["voice_clone_prompt"] = service.get_or_create_voice_clone_prompt(
-                model,
-                cache_key=(
-                    f"{prepared.voice_ref_audio_path.resolve()}::{prepared.voice_ref_text!r}"
-                ),
-                ref_audio_path=prepared.voice_ref_audio_path,
-                ref_text=prepared.voice_ref_text,
+            generation_args["voice_clone_prompt"] = (
+                service.get_or_create_voice_clone_prompt(
+                    model,
+                    cache_key=(
+                        f"{prepared.voice_ref_audio_path.resolve()}::{prepared.voice_ref_text!r}"
+                    ),
+                    ref_audio_path=prepared.voice_ref_audio_path,
+                    ref_text=prepared.voice_ref_text,
+                )
             )
         with torch.inference_mode():
             audios = model.generate(**generation_args)
@@ -1715,7 +2264,9 @@ async def _synthesize_prepared(
             "Speech synthesis failed (request_id=%s, voice=%s, voice_source=%s, language=%s)",
             request_id or "n/a",
             prepared.voice_id,
-            "local-reference" if prepared.voice_ref_audio_path is not None else "style-prompt",
+            "local-reference"
+            if prepared.voice_ref_audio_path is not None
+            else "style-prompt",
             prepared.language,
         )
         raise HTTPException(status_code=500, detail="Speech synthesis failed") from exc
@@ -1727,16 +2278,22 @@ async def _synthesize_prepared(
 async def lifespan(_: FastAPI):
     _configure_logging()
     service.set_lock(asyncio.Lock())
+    asr_service.set_lock(asyncio.Lock())
     LOG.info(
-        "Starting OmniVoice TTS server (api_model=%s, backend_model=%s, device=%s, idle_timeout=%.0fs)",
+        "Starting OmniVoice TTS server (api_model=%s, backend_model=%s, device=%s, idle_timeout=%.0fs, asr_model=%s, asr_device=%s, asr_idle_timeout=%.0fs)",
         API_MODEL_ID,
         service.model_id,
         service.device,
         service._idle_timeout,
+        asr_service.model_id,
+        asr_service.device,
+        asr_service._idle_timeout,
     )
     yield
     if service._idle_task is not None:
         service._idle_task.cancel()
+    if asr_service._idle_task is not None:
+        asr_service._idle_task.cancel()
     if service.model is not None:
         LOG.info("Shutting down, offloading model...")
         try:
@@ -1746,9 +2303,20 @@ async def lifespan(_: FastAPI):
                 service.model = None
         except Exception:
             LOG.exception("Error offloading model during shutdown")
+    if asr_service.pipeline is not None:
+        LOG.info("Shutting down, offloading ASR model...")
+        try:
+            await asyncio.to_thread(asr_service._offload_pipeline_sync)
+        except Exception:
+            LOG.exception("Error offloading ASR model during shutdown")
 
 
 service = OmniVoiceService(BACKEND_MODEL_ID, DEFAULT_DEVICE)
+asr_service = ASRService(
+    DEFAULT_ASR_MODEL_ID,
+    DEFAULT_ASR_DEVICE,
+    idle_timeout=DEFAULT_ASR_IDLE_TIMEOUT,
+)
 app = FastAPI(title="OmniVoice OpenAI-Compatible TTS", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
@@ -1802,7 +2370,11 @@ async def health() -> dict[str, object]:
     return {
         "status": "ok",
         "supported_response_formats": sorted(SUPPORTED_RESPONSE_FORMATS),
+        "supported_transcription_response_formats": sorted(
+            SUPPORTED_TRANSCRIPTION_RESPONSE_FORMATS
+        ),
         **service.health(),
+        **asr_service.health(),
     }
 
 
@@ -1846,10 +2418,14 @@ async def list_audio_voices() -> dict[str, list[dict[str, str]]]:
 async def audio_speech(payload: SpeechRequest, request: Request) -> Response:
     _ = request.headers.get("authorization")
     request_id = getattr(request.state, "request_id", uuid4().hex[:12])
-    request_source = getattr(request.state, "request_source", _guess_request_source(request))
+    request_source = getattr(
+        request.state, "request_source", _guess_request_source(request)
+    )
     prepared = _prepare_request(payload)
     voice_mode = (
-        "local-reference" if prepared.voice_ref_audio_path is not None else "style-prompt"
+        "local-reference"
+        if prepared.voice_ref_audio_path is not None
+        else "style-prompt"
     )
     ref_text_source = (
         "request"
@@ -1868,7 +2444,9 @@ async def audio_speech(payload: SpeechRequest, request: Request) -> Response:
         len(payload.raw_text()),
         len(prepared.text),
         _normalization_summary(payload.normalization_options),
-        prepared.voice_ref_audio_path.name if prepared.voice_ref_audio_path is not None else "-",
+        prepared.voice_ref_audio_path.name
+        if prepared.voice_ref_audio_path is not None
+        else "-",
         ref_text_source,
         len(prepared.voice_ref_text or prepared.ref_text or ""),
         _truncate_preview(payload.raw_text()),
@@ -1888,10 +2466,71 @@ async def audio_speech(payload: SpeechRequest, request: Request) -> Response:
         "X-OmniVoice-Sanitized-Chars": str(len(prepared.text)),
         "X-OmniVoice-Language": prepared.language or "",
         "X-OmniVoice-Voice-Source": (
-            "local-reference" if prepared.voice_ref_audio_path is not None else "style-prompt"
+            "local-reference"
+            if prepared.voice_ref_audio_path is not None
+            else "style-prompt"
         ),
     }
     return Response(content=audio_bytes, media_type=media_type, headers=headers)
+
+
+@app.post("/audio/transcriptions")
+@app.post("/v1/audio/transcriptions")
+async def audio_transcriptions(
+    file: UploadFile = File(...),
+    model: Optional[str] = Form(default=None),
+    language: Optional[str] = Form(default=None),
+    prompt: Optional[str] = Form(default=None),
+    response_format: Literal["json", "text", "srt", "verbose_json", "vtt"] = Form(
+        default="json"
+    ),
+    temperature: Optional[float] = Form(default=None),
+    timestamp_granularities: Optional[list[str]] = Form(default=None),
+    bracketed_timestamp_granularities: Optional[list[str]] = Form(
+        default=None,
+        alias="timestamp_granularities[]",
+    ),
+):
+    return await _handle_audio_transcription(
+        task="transcribe",
+        file=file,
+        model=model,
+        language=language,
+        prompt=prompt,
+        response_format=response_format,
+        temperature=temperature,
+        timestamp_granularities=timestamp_granularities,
+        bracketed_timestamp_granularities=bracketed_timestamp_granularities,
+    )
+
+
+@app.post("/audio/translations")
+@app.post("/v1/audio/translations")
+async def audio_translations(
+    file: UploadFile = File(...),
+    model: Optional[str] = Form(default=None),
+    prompt: Optional[str] = Form(default=None),
+    response_format: Literal["json", "text", "srt", "verbose_json", "vtt"] = Form(
+        default="json"
+    ),
+    temperature: Optional[float] = Form(default=None),
+    timestamp_granularities: Optional[list[str]] = Form(default=None),
+    bracketed_timestamp_granularities: Optional[list[str]] = Form(
+        default=None,
+        alias="timestamp_granularities[]",
+    ),
+):
+    return await _handle_audio_transcription(
+        task="translate",
+        file=file,
+        model=model,
+        language=None,
+        prompt=prompt,
+        response_format=response_format,
+        temperature=temperature,
+        timestamp_granularities=timestamp_granularities,
+        bracketed_timestamp_granularities=bracketed_timestamp_granularities,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1918,6 +2557,12 @@ def main() -> None:
     global service
     service = OmniVoiceService(
         args.model_id, args.device, idle_timeout=args.idle_timeout
+    )
+    global asr_service
+    asr_service = ASRService(
+        DEFAULT_ASR_MODEL_ID,
+        DEFAULT_ASR_DEVICE,
+        idle_timeout=DEFAULT_ASR_IDLE_TIMEOUT,
     )
 
     uvicorn.run(
