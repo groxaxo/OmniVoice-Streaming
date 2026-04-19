@@ -152,74 +152,94 @@ def trim_trailing_artifact(
     sampling_rate: int,
     silence_thresh: float = -50,
     min_silence_ms: int = 15,
-    max_artifact_ms: int = 200,
+    max_artifact_ms: int = 800,
+    energy_ratio_cap: float = 0.65,
+    max_passes: int = 3,
 ) -> torch.Tensor:
     """
-    Trim a short energy burst that appears after a silence gap at the end of audio.
+    Trim energy bursts that appear after silence gaps near the end of audio.
 
-    Masked diffusion models occasionally over-generate a few extra frames beyond
-    the last real phoneme, producing a brief (~80ms) artifact burst that is above
-    the silence threshold and therefore not removed by remove_silence_edges().
+    Masked diffusion models occasionally over-generate extra frames beyond
+    the last real phoneme, producing artifact bursts (50-600ms) that sit above
+    the silence threshold and survive ``remove_silence_edges()``.
 
-    The detection pattern is:
-        [real speech] → [silence ≥ min_silence_ms] → [short burst ≤ max_artifact_ms]
-                                                           ↑ trim from here
+    The actual pattern in the waveform is often::
+
+        [real speech] → [silence gap] → [artifact burst] → [trailing silence]
+
+    Multiple artifacts can stack (burst → silence → burst → silence), so the
+    function runs iteratively up to ``max_passes`` until no more artifacts are
+    found.
+
+    An additional energy-ratio guard prevents trimming legitimate speech: the
+    burst's RMS must be below ``energy_ratio_cap`` × the main-body RMS.
 
     Parameters:
         audio: PyTorch tensor of shape (C, T)
         sampling_rate: sample rate of the audio
         silence_thresh: dBFS level below which a frame is "silent" (default -50)
-        min_silence_ms: minimum gap length in ms to consider it a silence boundary (default 15)
-        max_artifact_ms: maximum length in ms of the post-silence burst to trim
+        min_silence_ms: minimum gap length in ms to qualify as a silence boundary
+        max_artifact_ms: maximum length in ms of a post-silence burst to trim
+        energy_ratio_cap: burst RMS must be below this fraction of main RMS
+        max_passes: maximum number of iterative trim passes
 
     Returns:
-        PyTorch tensor (C, T') with trailing artifact removed (if detected)
+        PyTorch tensor (C, T') with trailing artifacts removed (if detected)
     """
-    aseg = tensor_to_audiosegment(audio, sampling_rate)
-    duration_ms = len(aseg)
-    if duration_ms < min_silence_ms + max_artifact_ms:
-        return audio
+    for _ in range(max_passes):
+        aseg = tensor_to_audiosegment(audio, sampling_rate)
+        duration_ms = len(aseg)
+        if duration_ms < min_silence_ms + max_artifact_ms:
+            break
 
-    chunk_ms = 10  # analyse in 10ms chunks
-    # Scan the last (max_artifact_ms + 200ms) to keep it cheap
-    scan_start = max(0, duration_ms - max_artifact_ms - 200)
-    window = aseg[scan_start:]
+        chunk_ms = 10
+        scan_start = max(0, duration_ms - 2000)
+        window = aseg[scan_start:]
 
-    levels = []
-    for i in range(0, len(window), chunk_ms):
-        chunk = window[i : i + chunk_ms]
-        levels.append((scan_start + i, chunk.dBFS))
+        levels = []
+        for i in range(0, len(window), chunk_ms):
+            chunk = window[i : i + chunk_ms]
+            levels.append((scan_start + i, chunk.dBFS))
 
-    # Walk backwards: find [silence gap] → [short burst] at end
-    trim_at = None
-    in_burst = False
-    burst_start = None
-    burst_len = 0
-    silence_len = 0
+        trim_at = None
+        in_burst = False
+        burst_start = None
+        burst_len = 0
+        silence_len = 0
 
-    for pos, lvl in reversed(levels):
-        if not in_burst:
-            if lvl > silence_thresh:
-                in_burst = True
-                burst_start = pos
-                burst_len = chunk_ms
-                silence_len = 0
-        else:
-            if lvl > silence_thresh:
-                burst_len += chunk_ms
-                if burst_len > max_artifact_ms:
-                    # Too long to be an artifact — it's real speech
-                    break
+        for pos, lvl in reversed(levels):
+            if not in_burst:
+                if lvl > silence_thresh:
+                    in_burst = True
+                    burst_start = pos
+                    burst_len = chunk_ms
+                    silence_len = 0
             else:
-                silence_len += chunk_ms
-                if silence_len >= min_silence_ms:
-                    # Found: silence gap followed by a short burst → artifact
-                    trim_at = burst_start
-                    break
+                if lvl > silence_thresh:
+                    burst_len += chunk_ms
+                    if burst_len > max_artifact_ms:
+                        break
+                else:
+                    silence_len += chunk_ms
+                    if silence_len >= min_silence_ms:
+                        trim_at = burst_start
+                        break
 
-    if trim_at is not None and trim_at > 0:
+        if trim_at is None or trim_at <= 0:
+            break
+
         trim_samples = int(trim_at * sampling_rate / 1000)
-        audio = audio[:, :trim_samples]
+        main_audio = audio[:, :trim_samples]
+        artifact_audio = audio[:, trim_samples:]
+        if main_audio.numel() > 0 and artifact_audio.numel() > 0:
+            main_rms = torch.sqrt(torch.mean(main_audio ** 2)).item()
+            art_rms = torch.sqrt(torch.mean(artifact_audio ** 2)).item()
+            if main_rms > 1e-6 and art_rms / main_rms < energy_ratio_cap:
+                audio = main_audio
+            else:
+                break
+        else:
+            audio = audio[:, :trim_samples]
 
     return audio
 
