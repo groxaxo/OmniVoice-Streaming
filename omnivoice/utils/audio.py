@@ -147,6 +147,83 @@ def remove_silence_edges(
     return audio
 
 
+def trim_trailing_artifact(
+    audio: torch.Tensor,
+    sampling_rate: int,
+    silence_thresh: float = -50,
+    min_silence_ms: int = 15,
+    max_artifact_ms: int = 200,
+) -> torch.Tensor:
+    """
+    Trim a short energy burst that appears after a silence gap at the end of audio.
+
+    Masked diffusion models occasionally over-generate a few extra frames beyond
+    the last real phoneme, producing a brief (~80ms) artifact burst that is above
+    the silence threshold and therefore not removed by remove_silence_edges().
+
+    The detection pattern is:
+        [real speech] → [silence ≥ min_silence_ms] → [short burst ≤ max_artifact_ms]
+                                                           ↑ trim from here
+
+    Parameters:
+        audio: PyTorch tensor of shape (C, T)
+        sampling_rate: sample rate of the audio
+        silence_thresh: dBFS level below which a frame is "silent" (default -50)
+        min_silence_ms: minimum gap length in ms to consider it a silence boundary (default 15)
+        max_artifact_ms: maximum length in ms of the post-silence burst to trim
+
+    Returns:
+        PyTorch tensor (C, T') with trailing artifact removed (if detected)
+    """
+    aseg = tensor_to_audiosegment(audio, sampling_rate)
+    duration_ms = len(aseg)
+    if duration_ms < min_silence_ms + max_artifact_ms:
+        return audio
+
+    chunk_ms = 10  # analyse in 10ms chunks
+    # Scan the last (max_artifact_ms + 200ms) to keep it cheap
+    scan_start = max(0, duration_ms - max_artifact_ms - 200)
+    window = aseg[scan_start:]
+
+    levels = []
+    for i in range(0, len(window), chunk_ms):
+        chunk = window[i : i + chunk_ms]
+        levels.append((scan_start + i, chunk.dBFS))
+
+    # Walk backwards: find [silence gap] → [short burst] at end
+    trim_at = None
+    in_burst = False
+    burst_start = None
+    burst_len = 0
+    silence_len = 0
+
+    for pos, lvl in reversed(levels):
+        if not in_burst:
+            if lvl > silence_thresh:
+                in_burst = True
+                burst_start = pos
+                burst_len = chunk_ms
+                silence_len = 0
+        else:
+            if lvl > silence_thresh:
+                burst_len += chunk_ms
+                if burst_len > max_artifact_ms:
+                    # Too long to be an artifact — it's real speech
+                    break
+            else:
+                silence_len += chunk_ms
+                if silence_len >= min_silence_ms:
+                    # Found: silence gap followed by a short burst → artifact
+                    trim_at = burst_start
+                    break
+
+    if trim_at is not None and trim_at > 0:
+        trim_samples = int(trim_at * sampling_rate / 1000)
+        audio = audio[:, :trim_samples]
+
+    return audio
+
+
 def audiosegment_to_tensor(aseg):
     """
     Convert a pydub.AudioSegment to PyTorch audio tensor
@@ -357,8 +434,6 @@ def cross_fade_chunks(
 
         # Silence gap after every chunk except the last
         if idx < len(chunks) - 1:
-            parts.append(
-                torch.zeros(chunk.shape[0], silence_n, device=dev, dtype=dt)
-            )
+            parts.append(torch.zeros(chunk.shape[0], silence_n, device=dev, dtype=dt))
 
     return torch.cat(parts, dim=-1)

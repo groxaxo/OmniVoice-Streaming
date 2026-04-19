@@ -58,6 +58,7 @@ from omnivoice.utils.audio import (
     load_audio,
     remove_silence,
     trim_long_audio,
+    trim_trailing_artifact,
 )
 from omnivoice.utils.common import (
     configure_cuda_inference,
@@ -454,7 +455,6 @@ class OmniVoice(PreTrainedModel):
         ).permute(0, 2, 1, 3)
 
         if labels is not None:
-
             # audio_logits.permute(0, 3, 1, 2):
             # [Batch, Layer, Seq, Vocab] -> [Batch, Vocab, Layer, Seq]
             # per_token_loss shape: [Batch, Layer, Seq]，ignore -100
@@ -612,7 +612,9 @@ class OmniVoice(PreTrainedModel):
             assert results[i] is not None, f"Result {i} was not generated"
             generated_audios.append(
                 self._decode_and_post_process(
-                    results[i], full_task.ref_rms[i], gen_config  # type: ignore[arg-type]
+                    results[i],
+                    full_task.ref_rms[i],
+                    gen_config,  # type: ignore[arg-type]
                 )
             )
 
@@ -706,9 +708,7 @@ class OmniVoice(PreTrainedModel):
         ref_wav = ref_wav[:, :-clip_size] if clip_size > 0 else ref_wav
         ref_audio_tokens = self.audio_tokenizer.encode(
             ref_wav.unsqueeze(0).to(self.audio_tokenizer.device),
-        ).audio_codes.squeeze(
-            0
-        )  # (C, T)
+        ).audio_codes.squeeze(0)  # (C, T)
 
         if preprocess_prompt:
             ref_text = add_punctuation(ref_text)
@@ -742,21 +742,15 @@ class OmniVoice(PreTrainedModel):
             pad_id = 0
             padded = torch.stack(
                 [
-                    torch.nn.functional.pad(
-                        t, (0, max_t - t.size(-1)), value=pad_id
-                    )
+                    torch.nn.functional.pad(t, (0, max_t - t.size(-1)), value=pad_id)
                     for t in tokens
                 ],
                 dim=0,
             ).to(tokenizer_device)  # (N, C, T_max)
             # Decode as a single batch — audio_values is (N, 1, T_wav).
-            decoded_batch = (
-                self.audio_tokenizer.decode(padded).audio_values.cpu()
-            )
+            decoded_batch = self.audio_tokenizer.decode(padded).audio_values.cpu()
             # Trim each chunk's waveform to match its original token length.
-            samples_per_token = (
-                decoded_batch.shape[-1] // max_t if max_t > 0 else 1
-            )
+            samples_per_token = decoded_batch.shape[-1] // max_t if max_t > 0 else 1
             chunk_audios = [
                 decoded_batch[j, :, : t.size(-1) * samples_per_token]
                 for j, t in enumerate(tokens)
@@ -797,6 +791,10 @@ class OmniVoice(PreTrainedModel):
                 mid_sil=500,
                 lead_sil=100,
                 trail_sil=100,
+            )
+            generated_audio = trim_trailing_artifact(
+                generated_audio,
+                self.sampling_rate,
             )
 
         if ref_rms is not None and ref_rms < 0.1:
@@ -949,9 +947,9 @@ class OmniVoice(PreTrainedModel):
         if isinstance(text, str):
             text_list = [text]
         else:
-            assert isinstance(
-                text, list
-            ), "text should be a string or a list of strings"
+            assert isinstance(text, list), (
+                "text should be a string or a list of strings"
+            )
             text_list = text
         batch_size = len(text_list)
 
@@ -1127,9 +1125,7 @@ class OmniVoice(PreTrainedModel):
             self.text_tokenizer(style_text, return_tensors="pt")
             .input_ids.repeat(self.config.num_audio_codebook, 1)
             .unsqueeze(0)
-        ).to(
-            self.device
-        )  # [1, C, N1]
+        ).to(self.device)  # [1, C, N1]
 
         # Build text tokens
         full_text = _combine_text(ref_text=ref_text, text=text)
@@ -1138,9 +1134,7 @@ class OmniVoice(PreTrainedModel):
             _tokenize_with_nonverbal_tags(wrapped_text, self.text_tokenizer)
             .repeat(self.config.num_audio_codebook, 1)
             .unsqueeze(0)
-        ).to(
-            self.device
-        )  # [1, C, N2]
+        ).to(self.device)  # [1, C, N2]
 
         # Target: all MASK
         target_audio_tokens = torch.full(
@@ -1416,8 +1410,8 @@ def _build_block_mask_document_ids(
     behavior without materializing a dense quadratic mask.
     """
     lengths_t = torch.tensor(lengths, dtype=torch.long, device=device)  # (B,)
-    pos = torch.arange(max_seq_len, device=device)                       # (S,)
-    is_pad = pos.unsqueeze(0) >= lengths_t.unsqueeze(1)                  # (B, S)
+    pos = torch.arange(max_seq_len, device=device)  # (S,)
+    is_pad = pos.unsqueeze(0) >= lengths_t.unsqueeze(1)  # (B, S)
     # Padding positions get unique negative ids: -(pos - length + 1)
     pad_ids = (lengths_t.unsqueeze(1) - pos.unsqueeze(0) - 1).to(torch.int32)
     return torch.where(is_pad, pad_ids, torch.zeros_like(pad_ids))
