@@ -49,7 +49,7 @@ DEFAULT_AUDIO_CHUNK_THRESHOLD = float(
     os.getenv("OMNIVOICE_AUDIO_CHUNK_THRESHOLD", "30.0")
 )
 DEFAULT_SENTENCE_CHUNKING_MIN_CHARS = int(
-    os.getenv("OMNIVOICE_SENTENCE_CHUNKING_MIN_CHARS", "280")
+    os.getenv("OMNIVOICE_SENTENCE_CHUNKING_MIN_CHARS", "100")
 )
 DEFAULT_ASR_MODEL_ID = os.getenv(
     "OMNIVOICE_ASR_MODEL_ID", "openai/whisper-large-v3-turbo"
@@ -472,6 +472,96 @@ VOICE_OPTIONS: list[VoiceOptionDefinition] = [
         default_language="es",
     ),
     VoiceOptionDefinition(
+        id="valentina",
+        fallback_name="valentina (female, Argentinian accent)",
+        fallback_instruct="female, warm pitch, argentinian accent",
+        sample_file="omnivoice_refs/valentina_ref.wav",
+        sample_label="Argentinian female speaker 01208 (15s)",
+        sample_duration_seconds=15.0,
+        default_language="es",
+    ),
+    VoiceOptionDefinition(
+        id="camila",
+        fallback_name="camila (female, Argentinian accent)",
+        fallback_instruct="female, warm pitch, argentinian accent",
+        sample_file="omnivoice_refs/camila_ref.wav",
+        sample_label="Argentinian female speaker 03034 (15s)",
+        sample_duration_seconds=15.0,
+        default_language="es",
+    ),
+    VoiceOptionDefinition(
+        id="isabella",
+        fallback_name="isabella (female, Argentinian accent)",
+        fallback_instruct="female, warm pitch, argentinian accent",
+        sample_file="omnivoice_refs/isabella_ref.wav",
+        sample_label="Argentinian female speaker 03349 (15s)",
+        sample_duration_seconds=15.0,
+        default_language="es",
+    ),
+    VoiceOptionDefinition(
+        id="sofia",
+        fallback_name="sofia (female, Argentinian accent)",
+        fallback_instruct="female, warm pitch, argentinian accent",
+        sample_file="omnivoice_refs/sofia_ref.wav",
+        sample_label="Argentinian female speaker 03397 (15s)",
+        sample_duration_seconds=15.0,
+        default_language="es",
+    ),
+    VoiceOptionDefinition(
+        id="luciana",
+        fallback_name="luciana (female, Argentinian accent)",
+        fallback_instruct="female, warm pitch, argentinian accent",
+        sample_file="omnivoice_refs/luciana_ref.wav",
+        sample_label="Argentinian female speaker 03853 (15s)",
+        sample_duration_seconds=15.0,
+        default_language="es",
+    ),
+    VoiceOptionDefinition(
+        id="alejandra",
+        fallback_name="alejandra (female, Argentinian accent)",
+        fallback_instruct="female, warm pitch, argentinian accent",
+        sample_file="omnivoice_refs/alejandra_ref.wav",
+        sample_label="Argentinian female speaker 05223 (15s)",
+        sample_duration_seconds=15.0,
+        default_language="es",
+    ),
+    VoiceOptionDefinition(
+        id="rosario",
+        fallback_name="rosario (female, Argentinian accent)",
+        fallback_instruct="female, warm pitch, argentinian accent",
+        sample_file="omnivoice_refs/rosario_ref.wav",
+        sample_label="Argentinian female speaker 05679 (15s)",
+        sample_duration_seconds=15.0,
+        default_language="es",
+    ),
+    VoiceOptionDefinition(
+        id="martina",
+        fallback_name="martina (female, Argentinian accent)",
+        fallback_instruct="female, warm pitch, argentinian accent",
+        sample_file="omnivoice_refs/martina_ref.wav",
+        sample_label="Argentinian female speaker 08784 (15s)",
+        sample_duration_seconds=15.0,
+        default_language="es",
+    ),
+    VoiceOptionDefinition(
+        id="florencia",
+        fallback_name="florencia (female, Argentinian accent)",
+        fallback_instruct="female, warm pitch, argentinian accent",
+        sample_file="omnivoice_refs/florencia_ref.wav",
+        sample_label="Argentinian female speaker 08886 (15s)",
+        sample_duration_seconds=15.0,
+        default_language="es",
+    ),
+    VoiceOptionDefinition(
+        id="catalina",
+        fallback_name="catalina (female, Argentinian accent)",
+        fallback_instruct="female, warm pitch, argentinian accent",
+        sample_file="omnivoice_refs/catalina_ref.wav",
+        sample_label="Argentinian female speaker 09799 (15s)",
+        sample_duration_seconds=15.0,
+        default_language="es",
+    ),
+    VoiceOptionDefinition(
         id="mergy",
         fallback_name="mergy (female, Welsh base + British instruct bias)",
         fallback_instruct="female, young adult, moderate pitch, british accent",
@@ -480,6 +570,99 @@ VOICE_OPTIONS: list[VoiceOptionDefinition] = [
         sample_label="Welsh female base (downloads/audio.wav cleaned)",
         sample_duration_seconds=4.1,
         default_language="en",
+    ),
+    VoiceOptionDefinition(
+        id="alicia",
+        fallback_name="alicia (female, New Zealand English dataset voice)",
+        fallback_instruct="female, moderate pitch, new zealand english accent",
+        sample_file="omnivoice_refs/alicia_ref.wav",
+        sample_ref_text=None,
+        sample_label="New Zealand English female dataset reference (15s)",
+        sample_duration_seconds=15.0,
+        default_language="en",
+    ),
+    VoiceOptionDefinition(
+        id="adam",
+        fallback_name="adam (male, New Zealand English dataset voice)",
+        fallback_instruct="male, moderate pitch, new zealand english accent",
+        sample_file="omnivoice_refs/adam_ref.wav",
+        sample_ref_text=None,
+        sample_label="New Zealand English male dataset reference (15s)",
+        sample_duration_seconds=15.0,
+        default_language="en",
+    ),
+    VoiceOptionDefinition(
+        id="facu",
+        fallback_name="facu (male, Argentine accent, Facu's cloned voice)",
+        fallback_instruct="male, young adult, moderate pitch, argentinian accent",
+        sample_file="omnivoice_refs/facu_ref_15s.wav",
+        sample_ref_text=None,
+        sample_label="Facu voice reference (15s)",
+        sample_duration_seconds=15.0,
+        default_language="es",
+    ),
+    VoiceOptionDefinition(
+        id="facu-live",
+        fallback_name="facu-live (male, Argentine accent, live voice reference)",
+        fallback_instruct="male, young adult, moderate pitch, argentinian accent",
+        sample_file="omnivoice_refs/facu_live_ref.wav",
+        sample_ref_text=None,
+        sample_label="Facu live voice reference (11s)",
+        sample_duration_seconds=11.0,
+        default_language="es",
+    ),
+    VoiceOptionDefinition(
+        id="vozfemenina",
+        fallback_name="vozfemenina (female, Spanish reference from Music folder)",
+        fallback_instruct="female, warm pitch, neutral spanish accent",
+        sample_file="omnivoice_refs/vozfemenina_ref.wav",
+        sample_ref_text=None,
+        sample_label="Spanish female reference from vozfemenina.mp3 (15s)",
+        sample_duration_seconds=15.0,
+        default_language="es",
+    ),
+    VoiceOptionDefinition(
+        id="monica",
+        fallback_name="monica (female, Argentinian accent, warm everyday voice)",
+        fallback_instruct="female, warm pitch, argentinian accent, natural conversational tone",
+        sample_file="omnivoice_refs/monica_ref.wav",
+        sample_ref_text=(
+            "Definitivamente, el departamento tiene que tener terraza o balcón. "
+            "Hace mucho tiempo que tenía ganas de usar esta aplicación para aprender a cocinar. "
+            "En el teléfono hay una pestaña que dice aplicaciones. Apretá el icono azul. "
+            "Te puedo compartir algunos videos para que veas lo que pasó."
+        ),
+        sample_label="Mónica — Argentinian female (MonicaArg.wav, 15s)",
+        sample_duration_seconds=15.0,
+        default_language="es",
+    ),
+    VoiceOptionDefinition(
+        id="elena",
+        fallback_name="elena (female, Latin American Spanish, warm presenter tone)",
+        fallback_instruct="female, warm moderate pitch, latin american spanish accent, engaging presenter tone",
+        sample_file="omnivoice_refs/elena_ref.wav",
+        sample_ref_text=(
+            "Indie, es un placer tenerte acá de nuevo y si es la primera vez que me ves, "
+            "bienvenido, bienvenida. Hoy vamos a hablar de cómo volverte irresistiblemente "
+            "magnético, magnética y que todo el mundo se asocie con vos. Primero te recuerdo "
+            "que si aún no lo estás, te suscribas al canal."
+        ),
+        sample_label="Elena — Latin American Spanish female (WomanLatinamericana.mp3, 15s)",
+        sample_duration_seconds=15.0,
+        default_language="es",
+    ),
+    VoiceOptionDefinition(
+        id="grok",
+        fallback_name="grok (male, porteño accent, warm storyteller, Grok-inspired)",
+        fallback_instruct=(
+            "male, young adult, warm moderate pitch, argentinian porteño accent, "
+            "expressive storytelling tone, natural cadence with subtle humor"
+        ),
+        sample_file=None,
+        sample_ref_text=None,
+        sample_label="Grok-inspired Argentine narrator (instruct only)",
+        sample_duration_seconds=0,
+        default_language="es",
     ),
     VoiceOptionDefinition(
         id="auto",
@@ -1034,6 +1217,15 @@ class OmniVoiceService:
                 LOG.info("Model offloaded successfully")
             except Exception:
                 LOG.exception("Failed to offload model")
+
+        # Shut down this worker process so the GPU slot is fully freed and the
+        # pool manager can respawn on the next request (cold-start-on-demand).
+        import signal
+
+        LOG.info(
+            "Idle timeout reached — shutting down worker process to free GPU slot"
+        )
+        os.kill(os.getpid(), signal.SIGTERM)
 
     def _offload_model_sync(self) -> None:
         if self.model is None:
@@ -2271,6 +2463,8 @@ async def _synthesize_prepared(
         )
         raise HTTPException(status_code=500, detail="Speech synthesis failed") from exc
 
+    # Reset idle timer so the full idle window starts from synthesis completion.
+    service._touch()
     return prepared, audio_bytes, media_type
 
 
