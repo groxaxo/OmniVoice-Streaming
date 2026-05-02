@@ -191,9 +191,11 @@ def trim_trailing_artifact(
     scan_padding_ms = 1200
     # Keep the RMS guard bounded for long generations while sampling nearby speech.
     energy_context_seconds = 5
-    chunk_samples = max(1, int(round(chunk_ms * sampling_rate / 1000)))
-    min_silence_samples = max(1, int(round(min_silence_ms * sampling_rate / 1000)))
-    max_artifact_samples = max(1, int(round(max_artifact_ms * sampling_rate / 1000)))
+    chunk_samples = int(round(chunk_ms * sampling_rate / 1000))
+    min_silence_samples = int(round(min_silence_ms * sampling_rate / 1000))
+    max_artifact_samples = int(round(max_artifact_ms * sampling_rate / 1000))
+    if chunk_samples <= 0 or min_silence_samples <= 0 or max_artifact_samples <= 0:
+        raise ValueError("sampling_rate is too low for the configured trim windows")
     scan_samples = max_artifact_samples + max(
         min_silence_samples, int(round(scan_padding_ms * sampling_rate / 1000))
     )
@@ -244,7 +246,9 @@ def trim_trailing_artifact(
             break
 
         trim_samples = trim_at
-        energy_context_samples = min(trim_samples, sampling_rate * energy_context_seconds)
+        energy_context_samples = min(
+            trim_samples, int(sampling_rate * energy_context_seconds)
+        )
         main_audio = audio[:, trim_samples - energy_context_samples : trim_samples]
         artifact_audio = audio[:, trim_samples:]
         if main_audio.numel() > 0 and artifact_audio.numel() > 0:
