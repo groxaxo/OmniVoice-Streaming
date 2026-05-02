@@ -203,18 +203,11 @@ def trim_trailing_artifact(
         scan_start = max(0, total_samples - scan_samples)
         window = audio[:, scan_start:]
         num_chunks = (window.size(-1) + chunk_samples - 1) // chunk_samples
-
-        starts = []
-        ends = []
-        loud = []
-        for i in range(num_chunks):
-            start = i * chunk_samples
-            end = min(start + chunk_samples, window.size(-1))
-            chunk = window[:, start:end]
-            rms = torch.sqrt(torch.mean(chunk.float() ** 2))
-            starts.append(scan_start + start)
-            ends.append(scan_start + end)
-            loud.append(bool(rms > silence_rms))
+        padded_len = num_chunks * chunk_samples
+        if padded_len != window.size(-1):
+            window = torch.nn.functional.pad(window, (0, padded_len - window.size(-1)))
+        chunked = window.float().reshape(audio.size(0), num_chunks, chunk_samples)
+        loud = (torch.sqrt(torch.mean(chunked ** 2, dim=(0, 2))) > silence_rms).tolist()
 
         trim_at = None
         in_burst = False
@@ -222,16 +215,18 @@ def trim_trailing_artifact(
         burst_len = 0
         silence_len = 0
 
-        for pos, end, is_loud in zip(reversed(starts), reversed(ends), reversed(loud)):
+        for chunk_idx in range(num_chunks - 1, -1, -1):
+            pos = scan_start + chunk_idx * chunk_samples
+            end = min(pos + chunk_samples, total_samples)
             chunk_len = end - pos
             if not in_burst:
-                if is_loud:
+                if loud[chunk_idx]:
                     in_burst = True
                     burst_start = pos
                     burst_len = chunk_len
                     silence_len = 0
             else:
-                if is_loud:
+                if loud[chunk_idx]:
                     burst_len += chunk_len
                     if burst_len > max_artifact_samples:
                         break
