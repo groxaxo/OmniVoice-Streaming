@@ -34,6 +34,7 @@ _ARTIFACT_ENERGY_CONTEXT_SECONDS = 5
 
 
 def _rms(audio: torch.Tensor, dim=None) -> torch.Tensor:
+    """Return root-mean-square amplitude for an audio tensor over ``dim``."""
     return torch.sqrt(torch.mean(audio.float() ** 2, dim=dim))
 
 
@@ -180,7 +181,8 @@ def trim_trailing_artifact(
     found.
 
     An additional energy-ratio guard prevents trimming legitimate speech: the
-    burst's RMS must be below ``energy_ratio_cap`` × the main-body RMS.
+    burst's RMS must be below ``energy_ratio_cap`` × the RMS of recent main-body
+    audio before the trim point.
 
     Parameters:
         audio: PyTorch tensor of shape (C, T)
