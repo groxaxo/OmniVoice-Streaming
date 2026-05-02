@@ -186,20 +186,35 @@ def trim_trailing_artifact(
     Returns:
         PyTorch tensor (C, T') with trailing artifacts removed (if detected)
     """
+    chunk_ms = 10
+    chunk_samples = max(1, int(round(chunk_ms * sampling_rate / 1000)))
+    min_silence_samples = max(1, int(round(min_silence_ms * sampling_rate / 1000)))
+    max_artifact_samples = max(1, int(round(max_artifact_ms * sampling_rate / 1000)))
+    scan_samples = max_artifact_samples + max(
+        min_silence_samples, int(round(1200 * sampling_rate / 1000))
+    )
+    silence_rms = 10 ** (silence_thresh / 20)
+
     for _ in range(max_passes):
-        aseg = tensor_to_audiosegment(audio, sampling_rate)
-        duration_ms = len(aseg)
-        if duration_ms < min_silence_ms + max_artifact_ms:
+        total_samples = audio.size(-1)
+        if total_samples < min_silence_samples + chunk_samples:
             break
 
-        chunk_ms = 10
-        scan_start = max(0, duration_ms - 2000)
-        window = aseg[scan_start:]
+        scan_start = max(0, total_samples - scan_samples)
+        window = audio[:, scan_start:]
+        num_chunks = (window.size(-1) + chunk_samples - 1) // chunk_samples
 
-        levels = []
-        for i in range(0, len(window), chunk_ms):
-            chunk = window[i : i + chunk_ms]
-            levels.append((scan_start + i, chunk.dBFS))
+        starts = []
+        ends = []
+        loud = []
+        for i in range(num_chunks):
+            start = i * chunk_samples
+            end = min(start + chunk_samples, window.size(-1))
+            chunk = window[:, start:end]
+            rms = torch.sqrt(torch.mean(chunk.float() ** 2))
+            starts.append(scan_start + start)
+            ends.append(scan_start + end)
+            loud.append(bool(rms > silence_rms))
 
         trim_at = None
         in_burst = False
@@ -207,35 +222,37 @@ def trim_trailing_artifact(
         burst_len = 0
         silence_len = 0
 
-        for pos, lvl in reversed(levels):
+        for pos, end, is_loud in zip(reversed(starts), reversed(ends), reversed(loud)):
+            chunk_len = end - pos
             if not in_burst:
-                if lvl > silence_thresh:
+                if is_loud:
                     in_burst = True
                     burst_start = pos
-                    burst_len = chunk_ms
+                    burst_len = chunk_len
                     silence_len = 0
             else:
-                if lvl > silence_thresh:
-                    burst_len += chunk_ms
-                    if burst_len > max_artifact_ms:
+                if is_loud:
+                    burst_len += chunk_len
+                    if burst_len > max_artifact_samples:
                         break
                 else:
-                    silence_len += chunk_ms
-                    if silence_len >= min_silence_ms:
+                    silence_len += chunk_len
+                    if silence_len >= min_silence_samples:
                         trim_at = burst_start
                         break
 
         if trim_at is None or trim_at <= 0:
             break
 
-        trim_samples = int(trim_at * sampling_rate / 1000)
-        main_audio = audio[:, :trim_samples]
+        trim_samples = trim_at
+        energy_context_samples = min(trim_samples, sampling_rate * 5)
+        main_audio = audio[:, trim_samples - energy_context_samples : trim_samples]
         artifact_audio = audio[:, trim_samples:]
         if main_audio.numel() > 0 and artifact_audio.numel() > 0:
-            main_rms = torch.sqrt(torch.mean(main_audio ** 2)).item()
-            art_rms = torch.sqrt(torch.mean(artifact_audio ** 2)).item()
+            main_rms = torch.sqrt(torch.mean(main_audio.float() ** 2)).item()
+            art_rms = torch.sqrt(torch.mean(artifact_audio.float() ** 2)).item()
             if main_rms > 1e-6 and art_rms / main_rms < energy_ratio_cap:
-                audio = main_audio
+                audio = audio[:, :trim_samples]
             else:
                 break
         else:

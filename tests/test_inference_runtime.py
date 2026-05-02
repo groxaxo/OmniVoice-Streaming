@@ -8,6 +8,7 @@ from omnivoice.models.omnivoice import (
     _build_inference_attention_mask,
     _mask_mod_packed,
 )
+from omnivoice.utils.audio import trim_trailing_artifact
 from omnivoice.utils.common import configure_cuda_inference, resolve_inference_dtype
 
 
@@ -137,6 +138,72 @@ class InferenceRuntimeTests(unittest.TestCase):
         cache["x"] = object()
         cache.clear()
         self.assertEqual(len(cache), 0)
+
+    def test_trim_trailing_artifact_removes_low_energy_tail(self) -> None:
+        sr = 1000
+        audio = torch.cat(
+            [
+                torch.full((1, 1000), 0.4),
+                torch.zeros(1, 50),
+                torch.full((1, 100), 0.04),
+                torch.zeros(1, 100),
+            ],
+            dim=-1,
+        )
+
+        trimmed = trim_trailing_artifact(
+            audio,
+            sr,
+            min_silence_ms=20,
+            max_artifact_ms=200,
+        )
+
+        self.assertEqual(trimmed.size(-1), 1050)
+
+    def test_trim_trailing_artifact_runs_multiple_passes(self) -> None:
+        sr = 1000
+        audio = torch.cat(
+            [
+                torch.full((1, 1000), 0.4),
+                torch.zeros(1, 50),
+                torch.full((1, 100), 0.04),
+                torch.zeros(1, 50),
+                torch.full((1, 80), 0.04),
+                torch.zeros(1, 100),
+            ],
+            dim=-1,
+        )
+
+        trimmed = trim_trailing_artifact(
+            audio,
+            sr,
+            min_silence_ms=20,
+            max_artifact_ms=200,
+            max_passes=3,
+        )
+
+        self.assertEqual(trimmed.size(-1), 1050)
+
+    def test_trim_trailing_artifact_keeps_loud_trailing_speech(self) -> None:
+        sr = 1000
+        audio = torch.cat(
+            [
+                torch.full((1, 1000), 0.4),
+                torch.zeros(1, 50),
+                torch.full((1, 100), 0.35),
+                torch.zeros(1, 100),
+            ],
+            dim=-1,
+        )
+
+        trimmed = trim_trailing_artifact(
+            audio,
+            sr,
+            min_silence_ms=20,
+            max_artifact_ms=200,
+        )
+
+        self.assertEqual(trimmed.size(-1), audio.size(-1))
 
 
 if __name__ == "__main__":
