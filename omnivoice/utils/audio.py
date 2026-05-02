@@ -28,6 +28,15 @@ import torchaudio
 from pydub import AudioSegment
 from pydub.silence import detect_leading_silence, detect_nonsilent, split_on_silence
 
+_ARTIFACT_SCAN_CHUNK_MS = 10
+_ARTIFACT_SCAN_PADDING_MS = 1200
+_ARTIFACT_ENERGY_CONTEXT_SECONDS = 5
+
+
+def _rms(audio: torch.Tensor, dim=None) -> torch.Tensor:
+    """Return root-mean-square amplitude for an audio tensor over ``dim``."""
+    return torch.sqrt(torch.mean(audio.float() ** 2, dim=dim))
+
 
 def load_audio(audio_path: str, sampling_rate: int):
     """
@@ -172,7 +181,8 @@ def trim_trailing_artifact(
     found.
 
     An additional energy-ratio guard prevents trimming legitimate speech: the
-    burst's RMS must be below ``energy_ratio_cap`` × the main-body RMS.
+    burst's RMS must be below ``energy_ratio_cap`` × the RMS of recent main-body
+    audio before the trim point.
 
     Parameters:
         audio: PyTorch tensor of shape (C, T)
@@ -186,20 +196,29 @@ def trim_trailing_artifact(
     Returns:
         PyTorch tensor (C, T') with trailing artifacts removed (if detected)
     """
+    chunk_samples = int(round(_ARTIFACT_SCAN_CHUNK_MS * sampling_rate / 1000))
+    min_silence_samples = int(round(min_silence_ms * sampling_rate / 1000))
+    max_artifact_samples = int(round(max_artifact_ms * sampling_rate / 1000))
+    if chunk_samples <= 0 or min_silence_samples <= 0 or max_artifact_samples <= 0:
+        raise ValueError("sampling_rate is too low for the configured trim windows")
+    scan_samples = max_artifact_samples + max(
+        min_silence_samples,
+        int(round(_ARTIFACT_SCAN_PADDING_MS * sampling_rate / 1000)),
+    )
+    silence_rms = 10 ** (silence_thresh / 20)
+
     for _ in range(max_passes):
-        aseg = tensor_to_audiosegment(audio, sampling_rate)
-        duration_ms = len(aseg)
-        if duration_ms < min_silence_ms + max_artifact_ms:
+        total_samples = audio.size(-1)
+        if total_samples < min_silence_samples + chunk_samples:
             break
 
-        chunk_ms = 10
-        scan_start = max(0, duration_ms - 2000)
-        window = aseg[scan_start:]
-
-        levels = []
-        for i in range(0, len(window), chunk_ms):
-            chunk = window[i : i + chunk_ms]
-            levels.append((scan_start + i, chunk.dBFS))
+        scan_start = max(0, total_samples - scan_samples)
+        window = audio[:, scan_start:]
+        num_chunks = (window.size(-1) + chunk_samples - 1) // chunk_samples
+        padded_len = num_chunks * chunk_samples
+        window = torch.nn.functional.pad(window, (0, padded_len - window.size(-1)))
+        chunked = window.float().reshape(audio.size(0), num_chunks, chunk_samples)
+        loud = _rms(chunked, dim=(0, 2)) > silence_rms
 
         trim_at = None
         in_burst = False
@@ -207,35 +226,41 @@ def trim_trailing_artifact(
         burst_len = 0
         silence_len = 0
 
-        for pos, lvl in reversed(levels):
+        for chunk_idx in range(num_chunks - 1, -1, -1):
+            pos = scan_start + chunk_idx * chunk_samples
+            end = min(pos + chunk_samples, total_samples)
+            chunk_len = end - pos
             if not in_burst:
-                if lvl > silence_thresh:
+                if loud[chunk_idx].item():
                     in_burst = True
                     burst_start = pos
-                    burst_len = chunk_ms
+                    burst_len = chunk_len
                     silence_len = 0
             else:
-                if lvl > silence_thresh:
-                    burst_len += chunk_ms
-                    if burst_len > max_artifact_ms:
+                if loud[chunk_idx].item():
+                    burst_len += chunk_len
+                    if burst_len > max_artifact_samples:
                         break
                 else:
-                    silence_len += chunk_ms
-                    if silence_len >= min_silence_ms:
+                    silence_len += chunk_len
+                    if silence_len >= min_silence_samples:
                         trim_at = burst_start
                         break
 
         if trim_at is None or trim_at <= 0:
             break
 
-        trim_samples = int(trim_at * sampling_rate / 1000)
-        main_audio = audio[:, :trim_samples]
+        trim_samples = trim_at
+        energy_context_samples = min(
+            trim_samples, int(sampling_rate * _ARTIFACT_ENERGY_CONTEXT_SECONDS)
+        )
+        main_audio = audio[:, trim_samples - energy_context_samples : trim_samples]
         artifact_audio = audio[:, trim_samples:]
         if main_audio.numel() > 0 and artifact_audio.numel() > 0:
-            main_rms = torch.sqrt(torch.mean(main_audio ** 2)).item()
-            art_rms = torch.sqrt(torch.mean(artifact_audio ** 2)).item()
+            main_rms = _rms(main_audio).item()
+            art_rms = _rms(artifact_audio).item()
             if main_rms > 1e-6 and art_rms / main_rms < energy_ratio_cap:
-                audio = main_audio
+                audio = audio[:, :trim_samples]
             else:
                 break
         else:
