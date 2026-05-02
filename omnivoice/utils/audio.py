@@ -187,11 +187,15 @@ def trim_trailing_artifact(
         PyTorch tensor (C, T') with trailing artifacts removed (if detected)
     """
     chunk_ms = 10
+    # Extra scan context covers boundary silence before the artifact plus trailing silence.
+    scan_padding_ms = 1200
+    # Keep the RMS guard bounded for long generations while sampling nearby speech.
+    energy_context_seconds = 5
     chunk_samples = max(1, int(round(chunk_ms * sampling_rate / 1000)))
     min_silence_samples = max(1, int(round(min_silence_ms * sampling_rate / 1000)))
     max_artifact_samples = max(1, int(round(max_artifact_ms * sampling_rate / 1000)))
     scan_samples = max_artifact_samples + max(
-        min_silence_samples, int(round(1200 * sampling_rate / 1000))
+        min_silence_samples, int(round(scan_padding_ms * sampling_rate / 1000))
     )
     silence_rms = 10 ** (silence_thresh / 20)
 
@@ -240,7 +244,7 @@ def trim_trailing_artifact(
             break
 
         trim_samples = trim_at
-        energy_context_samples = min(trim_samples, sampling_rate * 5)
+        energy_context_samples = min(trim_samples, sampling_rate * energy_context_seconds)
         main_audio = audio[:, trim_samples - energy_context_samples : trim_samples]
         artifact_audio = audio[:, trim_samples:]
         if main_audio.numel() > 0 and artifact_audio.numel() > 0:
