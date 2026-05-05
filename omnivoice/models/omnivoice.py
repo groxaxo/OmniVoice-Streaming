@@ -748,8 +748,11 @@ class OmniVoice(PreTrainedModel):
         chunk_size = self.audio_tokenizer.config.hop_length
         clip_size = int(ref_wav.size(-1) % chunk_size)
         ref_wav = ref_wav[:, :-clip_size] if clip_size > 0 else ref_wav
+        # Cast ref_wav to the tokenizer's weight dtype (may be bf16 when loaded
+        # with a reduced-precision override) to avoid a FloatTensor/BFloat16 mismatch.
+        _tok_dtype = next(self.audio_tokenizer.parameters()).dtype
         ref_audio_tokens = self.audio_tokenizer.encode(
-            ref_wav.unsqueeze(0).to(self.audio_tokenizer.device),
+            ref_wav.unsqueeze(0).to(self.audio_tokenizer.device).to(_tok_dtype),
         ).audio_codes.squeeze(0)  # (C, T)
 
         if preprocess_prompt:
