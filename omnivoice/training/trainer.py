@@ -283,8 +283,11 @@ class OmniTrainer:
             with self.accelerator.accumulate(self.model):
                 outputs = self.model(**batch)
                 loss = outputs.loss
+                # Apply manual loss scaling for BF16 (BF16 uses no GradScaler).
+                # This prevents gradient underflow when the model loss is near machine-epsilon.
+                scaled_loss = loss * self.config.loss_scale
                 tr_loss += loss.detach()
-                self.accelerator.backward(loss)
+                self.accelerator.backward(scaled_loss)
 
                 if self.accelerator.sync_gradients:
                     # Clipping

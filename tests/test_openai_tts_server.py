@@ -11,9 +11,11 @@ from omnivoice.openai_tts_server import (
     _resolve_voice,
     _supported_models,
     _supported_voices,
+    _waveform_to_bytes,
     app,
     sanitize_prompt_text,
     sanitize_speech_text,
+    asr_service,
     service,
 )
 
@@ -37,6 +39,74 @@ class _FakeModel:
 class OpenAITTSServerTests(unittest.TestCase):
     def setUp(self) -> None:
         service._voice_prompt_cache.clear()
+
+    def test_audio_transcriptions_endpoint_accepts_openwebui_multipart_upload(
+        self,
+    ) -> None:
+        with (
+            patch.object(
+                asr_service,
+                "transcribe_file",
+                new=AsyncMock(return_value={"text": "hola mundo"}),
+            ) as mock_transcribe,
+            TestClient(app) as client,
+        ):
+            response = client.post(
+                "/v1/audio/transcriptions",
+                files={"file": ("sample.wav", b"RIFFfake", "audio/wav")},
+                data={"model": "whisper-1", "language": "es"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"text": "hola mundo"})
+        self.assertEqual(mock_transcribe.await_args.kwargs["task"], "transcribe")
+        self.assertEqual(mock_transcribe.await_args.kwargs["language"], "es")
+
+    def test_audio_transcriptions_text_response_format_returns_plain_text(self) -> None:
+        with (
+            patch.object(
+                asr_service,
+                "transcribe_file",
+                new=AsyncMock(return_value={"text": "plain transcript"}),
+            ),
+            TestClient(app) as client,
+        ):
+            response = client.post(
+                "/audio/transcriptions",
+                files={"file": ("sample.wav", b"RIFFfake", "audio/wav")},
+                data={"response_format": "text"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("text/plain", response.headers["content-type"])
+        self.assertEqual(response.text, "plain transcript")
+
+    def test_audio_translations_endpoint_uses_translate_task(self) -> None:
+        with (
+            patch.object(
+                asr_service,
+                "transcribe_file",
+                new=AsyncMock(return_value={"text": "hello world"}),
+            ) as mock_transcribe,
+            TestClient(app) as client,
+        ):
+            response = client.post(
+                "/v1/audio/translations",
+                files={"file": ("sample.wav", b"RIFFfake", "audio/wav")},
+                data={"model": "whisper-1"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"text": "hello world"})
+        self.assertEqual(mock_transcribe.await_args.kwargs["task"], "translate")
+
+    def test_waveform_to_bytes_returns_valid_wav_bytes(self) -> None:
+        waveform = torch.tensor([[0.0, 0.25, -0.25, 0.0]], dtype=torch.float32)
+
+        audio_bytes, media_type = _waveform_to_bytes(waveform, 24000, "wav")
+
+        self.assertEqual(media_type, "audio/wav")
+        self.assertTrue(audio_bytes.startswith(b"RIFF"))
 
     def test_sanitize_speech_text_preserves_bracket_tags_and_removes_control_tokens(
         self,
@@ -155,7 +225,9 @@ class OpenAITTSServerTests(unittest.TestCase):
 
         call = fake_model.calls[0]
         generation_config = call["generation_config"]
-        self.assertEqual(generation_config.audio_chunk_threshold, DEFAULT_AUDIO_CHUNK_THRESHOLD)
+        self.assertEqual(
+            generation_config.audio_chunk_threshold, DEFAULT_AUDIO_CHUNK_THRESHOLD
+        )
         if VOICE_LOOKUP["alloy"].has_local_sample():
             self.assertIn("voice_clone_prompt", call)
             self.assertTrue(call["voice_clone_prompt"]["ref_text"].strip())
@@ -219,7 +291,11 @@ class OpenAITTSServerTests(unittest.TestCase):
         ):
             response = client.post(
                 "/v1/audio/speech",
-                json={"input": "Hello world", "voice": "alloy", "response_format": "mp3"},
+                json={
+                    "input": "Hello world",
+                    "voice": "alloy",
+                    "response_format": "mp3",
+                },
             )
 
         self.assertEqual(response.status_code, 200)

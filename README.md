@@ -16,12 +16,13 @@
 
 OmniVoice Streaming is a maintained fork of the original [OmniVoice](https://github.com/k2-fsa/OmniVoice) project by Zhu Han and contributors. Thanks to the original OmniVoice creators for the base model, research, and pretrained checkpoints; this repo focuses on production hardening, server ergonomics, and fix-forward improvements around the original project.
 
-**Contents**: [Fork Highlights](#fork-highlights) | [Key Features](#key-features) | [Installation](#installation) | [Quick Start](#quick-start) | [Python API](#python-api) | [Command-Line Tools](#command-line-tools) | [Training & Evaluation](#training--evaluation) | [Discussion](#discussion--communication) | [Citation](#citation)
+**Contents**: [Fork Highlights](#fork-highlights) | [Key Features](#key-features) | [Installation](#installation) | [Quick Start](#quick-start) | [DealerVoice & Open WebUI Integration](#dealervoice--open-webui-integration) | [Python API](#python-api) | [Command-Line Tools](#command-line-tools) | [Training & Evaluation](#training--evaluation) | [Discussion](#discussion--communication) | [Citation](#citation)
 
 ## Fork Highlights
 
 - **Inference stability**: fixed the batched decoding mask regression that could produce gibberish outputs in CFG inference.
 - **Server defaults**: the OpenAI-compatible TTS server now keeps the upstream OmniVoice generation parameters intact unless you override them.
+- **Provider compatibility**: the server is a drop-in OpenAI TTS target for DealerVoice and Open WebUI, including Supertonic/Soprano/Chatterbox model aliases and DealerVoice voice aliases such as `M1` and `MonicaOptimized.wav`.
 - **Operational polish**: added clearer server docs, regression coverage, and transcription-based validation for English and Spanish audio.
 - **Upstream credit**: thanks to the original OmniVoice creators; this fork keeps that attribution front and center.
 
@@ -117,7 +118,43 @@ This fork also includes a GPU-aware router plus a Celery worker spawner for host
 ./scripts/install_omnivoice_user_services.sh
 ```
 
-That stack keeps the public API on port `6655`, starts internal OmniVoice workers on per-GPU ports beginning at `6656`, and only expands to a second worker when another configured GPU has enough free VRAM.
+That stack keeps the public API on port `6655`, starts internal OmniVoice workers on per-GPU ports beginning at `6656`, and only expands to a second worker when another configured GPU has enough free VRAM. The same install script also enables `omnivoice-gradio.service`, which runs the Gradio frontend against the router instead of loading a second model copy. Its port is controlled by `OMNIVOICE_GRADIO_PORT` (the bundled env file uses `7861`).
+
+### DealerVoice / Open WebUI-compatible alias
+
+On this machine the optimized pool exposes:
+
+| Purpose | URL |
+| --- | --- |
+| Main OmniVoice router | `http://127.0.0.1:6655` |
+| OpenAI-compatible alias for local apps | `http://127.0.0.1:8081/v1` |
+| Gradio frontend | `http://127.0.0.1:7861` |
+
+DealerVoice and Open WebUI can both use the OpenAI-compatible speech endpoint:
+
+```bash
+curl -o dealer-test.wav http://127.0.0.1:8081/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "supertonic",
+    "voice": "M1",
+    "input": "Thanks for calling Valley Auto Group. How can I help today?",
+    "response_format": "wav",
+    "speed": 1.0,
+    "total_steps": 24,
+    "stream": false
+  }'
+```
+
+Compatibility details:
+
+- `model` accepts `tts-1`, `tts-1-hd`, `gpt-4o-mini-tts`, `supertonic`, `soprano`, `chatterbox`, and `chatterbox-turbo`.
+- DealerVoice/Supertonic's `total_steps` maps to OmniVoice `num_step`.
+- DealerVoice/Supertonic's `lang_code` maps to OmniVoice `language`.
+- DealerVoice voice aliases `M1`, `default`, `MonicaOptimized`, and `MonicaOptimized.wav` map to the optimized `monica` reference voice by default.
+- Override voice aliases with `OMNIVOICE_VOICE_ALIASES`, for example `OMNIVOICE_VOICE_ALIASES="m1=alloy,default=monica"`.
+
+See [docs/dealervoice-openwebui.md](docs/dealervoice-openwebui.md) for the exact live wiring and smoke-test commands.
 
 For full usage, see the [Python API](#python-api) and [Command-Line Tools](#command-line-tools) sections below.
 

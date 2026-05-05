@@ -1,0 +1,19 @@
+[Unit]
+Description=OmniVoice GPU Router
+After=network-online.target omnivoice-celery.service
+Wants=network-online.target omnivoice-celery.service
+Requires=omnivoice-celery.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/op/OmniVoice
+EnvironmentFile=/home/op/.config/omnivoice/omnivoice-pool.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/op/OmniVoice/.venv/bin/python -m omnivoice.gpu_router
+Restart=always
+RestartSec=5
+TimeoutStartSec=180
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

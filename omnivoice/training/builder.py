@@ -46,6 +46,25 @@ from omnivoice.training.config import TrainingConfig
 logger = logging.getLogger(__name__)
 
 
+def _resolve_model_init_dtype(dtype_name: str | None) -> torch.dtype:
+    if dtype_name is None:
+        return torch.float32
+    normalized = dtype_name.strip().lower()
+    aliases = {
+        "float32": torch.float32,
+        "fp32": torch.float32,
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "half": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+    }
+    if normalized not in aliases:
+        valid = ", ".join(sorted(aliases))
+        raise ValueError(f"Unsupported init_dtype {dtype_name!r}. Expected one of: {valid}")
+    return aliases[normalized]
+
+
 def build_model_and_tokenizer(
     config: TrainingConfig,
 ) -> Tuple[OmniVoice, AutoTokenizer]:
@@ -76,12 +95,13 @@ def build_model_and_tokenizer(
     if tokens_to_add:
         tokenizer.add_special_tokens({"additional_special_tokens": tokens_to_add})
 
+    model_init_dtype = _resolve_model_init_dtype(config.init_dtype)
     if config.init_from_checkpoint:
         logger.info(f"Loading weights from {config.init_from_checkpoint}")
         model = OmniVoice.from_pretrained(
             config.init_from_checkpoint,
-            attn_implementation="flex_attention",
-            dtype=torch.float32,
+            attn_implementation=config.attn_implementation,
+            dtype=model_init_dtype,
             train=True,
         )
     else:
@@ -100,8 +120,8 @@ def build_model_and_tokenizer(
 
         llm = AutoModel.from_pretrained(
             config.llm_name_or_path,
-            attn_implementation="flex_attention",
-            dtype=torch.float32,
+            attn_implementation=config.attn_implementation,
+            dtype=model_init_dtype,
         )
 
         hf_logging.set_verbosity(original_level)

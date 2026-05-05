@@ -35,6 +35,7 @@ class TrainingConfig:
 
     # Model Specific
     llm_name_or_path: str = "Qwen/Qwen3-0.6B"
+    attn_implementation: str = "eager"
     audio_vocab_size: int = 1025  # valid vocab size + 1 (mask token)
     audio_mask_id: int = 1024  # 1024 is the 1025-th token
     num_audio_codebook: int = 8
@@ -54,6 +55,7 @@ class TrainingConfig:
     # Init settings
     resume_from_checkpoint: Optional[str] = None
     init_from_checkpoint: Optional[str] = None
+    init_dtype: Optional[str] = None
 
     # Training Hyperparams
     learning_rate: float = 1e-4
@@ -76,6 +78,11 @@ class TrainingConfig:
     allow_tf32: bool = True
     use_deepspeed: bool = False
     deepspeed_config: Optional[str] = None
+    # Loss scaling for BF16 training (BF16 has no automatic GradScaler unlike FP16).
+    # Set to e.g. 128.0 when training loss is near machine-epsilon (~1e-16) to prevent
+    # gradient underflow.  The trainer multiplies loss by this value before backward()
+    # and divides logged loss back by it so reported values are always unscaled.
+    loss_scale: float = 1.0
 
     # Logging
     logging_steps: int = 100

@@ -25,9 +25,13 @@ Usage:
 
 import argparse
 import logging
+import os
+import tempfile
 from typing import Any, Dict
+from urllib.parse import urlsplit, urlunsplit
 
 import gradio as gr
+import httpx
 import numpy as np
 
 from omnivoice import OmniVoice, OmniVoiceGenerationConfig
@@ -109,23 +113,45 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--model",
-        default="k2-fsa/OmniVoice",
+        default=os.getenv("OMNIVOICE_MODEL_ID", "k2-fsa/OmniVoice"),
         help="Model checkpoint path or HuggingFace repo id.",
     )
     parser.add_argument(
         "--device", default=None, help="Device to use. Auto-detected if not specified."
     )
-    parser.add_argument("--ip", default="0.0.0.0", help="Server IP (default: 0.0.0.0).")
     parser.add_argument(
-        "--port", type=int, default=7860, help="Server port (default: 7860)."
+        "--ip",
+        default=os.getenv("OMNIVOICE_GRADIO_HOST", "0.0.0.0"),
+        help="Server IP (default: 0.0.0.0).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.getenv("OMNIVOICE_GRADIO_PORT", "7860")),
+        help="Server port (default: 7860).",
     )
     parser.add_argument(
         "--root-path",
-        default=None,
+        default=os.getenv("OMNIVOICE_GRADIO_ROOT_PATH") or None,
         help="Root path for reverse proxy.",
     )
     parser.add_argument(
         "--share", action="store_true", default=False, help="Create public link."
+    )
+    parser.add_argument(
+        "--backend-url",
+        default=os.getenv("OMNIVOICE_GRADIO_BACKEND_URL") or None,
+        help=(
+            "Use an existing OmniVoice HTTP backend instead of loading the model "
+            "in the Gradio process. Accepts either the router base URL "
+            "(e.g. http://127.0.0.1:6655) or a /v1 URL."
+        ),
+    )
+    parser.add_argument(
+        "--backend-timeout",
+        type=float,
+        default=float(os.getenv("OMNIVOICE_GRADIO_BACKEND_TIMEOUT", "600")),
+        help="HTTP timeout in seconds when talking to the OmniVoice backend.",
     )
     parser.add_argument(
         "--no-asr",
@@ -135,6 +161,278 @@ def build_parser() -> argparse.ArgumentParser:
         " will be unavailable.",
     )
     return parser
+
+
+DEFAULT_BACKEND_DEMO_MODEL = "tts-1"
+DEFAULT_BACKEND_DEMO_VOICE = os.getenv("OMNIVOICE_DEFAULT_VOICE", "alloy")
+
+
+def _normalize_backend_url(raw_url: str) -> str:
+    url = (raw_url or "").strip()
+    if not url:
+        raise ValueError("Backend URL is empty.")
+    parsed = urlsplit(url)
+    if not parsed.scheme or not parsed.netloc:
+        raise ValueError(
+            "Backend URL must include a scheme and host, for example http://127.0.0.1:6655"
+        )
+    path = parsed.path.rstrip("/")
+    if path == "/v1":
+        path = ""
+    normalized = parsed._replace(path=path, query="", fragment="")
+    return urlunsplit(normalized).rstrip("/")
+
+
+def _backend_api_base(backend_url: str) -> str:
+    return f"{_normalize_backend_url(backend_url)}/v1"
+
+
+def _fetch_backend_catalog(
+    backend_url: str, *, timeout: float
+) -> tuple[list[str], dict[str, str], str]:
+    base_url = _normalize_backend_url(backend_url)
+    api_base = _backend_api_base(base_url)
+    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        health = client.get(f"{base_url}/health")
+        health.raise_for_status()
+        voices_response = client.get(f"{api_base}/audio/voices")
+        voices_response.raise_for_status()
+        models_response = client.get(f"{api_base}/models")
+        models_response.raise_for_status()
+
+    health_payload = health.json()
+    voices_payload = voices_response.json()
+    models_payload = models_response.json()
+
+    model_ids = [
+        item["id"]
+        for item in models_payload.get("data", [])
+        if isinstance(item, dict) and item.get("id")
+    ] or [DEFAULT_BACKEND_DEMO_MODEL]
+
+    voice_map: dict[str, str] = {}
+    for item in voices_payload.get("voices", []):
+        voice_id = item.get("id")
+        if not voice_id:
+            continue
+        label = item.get("name") or voice_id
+        if label in voice_map and voice_map[label] != voice_id:
+            label = f"{label} [{voice_id}]"
+        voice_map[label] = voice_id
+    if not voice_map:
+        voice_map[DEFAULT_BACKEND_DEMO_VOICE] = DEFAULT_BACKEND_DEMO_VOICE
+
+    status = (
+        f"Connected to {base_url} "
+        f"(health={health_payload.get('status', 'unknown')}, "
+        f"models={len(model_ids)}, voices={len(voice_map)})"
+    )
+    return model_ids, voice_map, status
+
+
+def build_backend_demo(backend_url: str, timeout: float) -> gr.Blocks:
+    normalized_backend_url = _normalize_backend_url(backend_url)
+    try:
+        initial_models, initial_voice_map, initial_status = _fetch_backend_catalog(
+            normalized_backend_url,
+            timeout=timeout,
+        )
+    except Exception as exc:
+        logging.warning("Failed to prefetch backend catalog from %s: %s", backend_url, exc)
+        initial_models = [DEFAULT_BACKEND_DEMO_MODEL]
+        initial_voice_map = {DEFAULT_BACKEND_DEMO_VOICE: DEFAULT_BACKEND_DEMO_VOICE}
+        initial_status = (
+            f"Backend catalog unavailable at startup: {type(exc).__name__}: {exc}"
+        )
+
+    initial_voice_choices = list(initial_voice_map)
+    initial_voice_value = initial_voice_choices[0]
+    initial_model_value = initial_models[0]
+
+    theme = gr.themes.Soft(font=["Inter", "Arial", "sans-serif"])
+    css = """
+    .gradio-container {max-width: 100% !important; font-size: 16px !important;}
+    .gradio-container h1 {font-size: 1.5em !important;}
+    .gradio-container .prose {font-size: 1.1em !important;}
+    .compact-audio audio {height: 60px !important;}
+    .compact-audio .waveform {min-height: 80px !important;}
+    """
+
+    def _lang_dropdown(label="Language (optional) / 语种 (可选)", value="Auto"):
+        return gr.Dropdown(
+            label=label,
+            choices=_ALL_LANGUAGES,
+            value=value,
+            allow_custom_value=False,
+            interactive=True,
+            info="Keep as Auto to auto-detect the language.",
+        )
+
+    def _refresh_catalog(current_voice_map: dict[str, str]):
+        try:
+            models, voice_map, status = _fetch_backend_catalog(
+                normalized_backend_url,
+                timeout=timeout,
+            )
+        except Exception as exc:
+            return (
+                gr.update(),
+                gr.update(),
+                f"Backend refresh failed: {type(exc).__name__}: {exc}",
+                current_voice_map,
+            )
+
+        voice_choices = list(voice_map)
+        return (
+            gr.update(choices=models, value=models[0]),
+            gr.update(choices=voice_choices, value=voice_choices[0]),
+            status,
+            voice_map,
+        )
+
+    def _generate_from_backend(
+        text: str,
+        model: str,
+        voice_label: str,
+        language: str,
+        instruct: str,
+        speed: float,
+        response_format: str,
+        voice_map: dict[str, str],
+    ):
+        if not text or not text.strip():
+            return None, "Please enter the text to synthesize."
+
+        voice_id = (voice_map or {}).get(voice_label, voice_label or DEFAULT_BACKEND_DEMO_VOICE)
+        payload: Dict[str, Any] = {
+            "model": model or DEFAULT_BACKEND_DEMO_MODEL,
+            "input": text.strip(),
+            "voice": voice_id,
+            "response_format": response_format,
+            "speed": float(speed or 1.0),
+            "sentence_chunking": True,
+        }
+        if language and language != "Auto":
+            payload["language"] = language
+        if instruct and instruct.strip():
+            payload["instruct"] = instruct.strip()
+
+        try:
+            with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+                response = client.post(
+                    f"{_backend_api_base(normalized_backend_url)}/audio/speech",
+                    json=payload,
+                )
+                response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            message = exc.response.text.strip() or exc.response.reason_phrase
+            return None, f"Backend error {exc.response.status_code}: {message}"
+        except Exception as exc:
+            return None, f"Backend request failed: {type(exc).__name__}: {exc}"
+
+        suffix = f".{response_format}"
+        with tempfile.NamedTemporaryFile(
+            prefix="omnivoice-gradio-",
+            suffix=suffix,
+            delete=False,
+        ) as tmp:
+            tmp.write(response.content)
+            audio_path = tmp.name
+
+        status = (
+            f"Done via {normalized_backend_url} "
+            f"(model={payload['model']}, voice={voice_id}, bytes={len(response.content)})"
+        )
+        return audio_path, status
+
+    with gr.Blocks(theme=theme, css=css, title="OmniVoice Gradio Frontend") as demo:
+        gr.Markdown(
+            f"""
+# OmniVoice Gradio Frontend
+
+This Gradio UI talks to the shared OmniVoice backend at **`{normalized_backend_url}`** instead of
+loading another model copy. Text sanitization, sentence chunking, voice presets, and Open WebUI
+compatibility all come from the backend router.
+"""
+        )
+
+        voice_map_state = gr.State(initial_voice_map)
+
+        with gr.Row():
+            with gr.Column(scale=1):
+                input_text = gr.Textbox(
+                    label="Text to Synthesize / 待合成文本",
+                    lines=6,
+                    placeholder="Enter the text you want to synthesize...",
+                )
+                voice_dropdown = gr.Dropdown(
+                    label="Voice preset / 声音预设",
+                    choices=initial_voice_choices,
+                    value=initial_voice_value,
+                    allow_custom_value=True,
+                    info="Choose a preset returned by the backend, or type a custom voice/instruct alias.",
+                )
+                language_dropdown = _lang_dropdown()
+                instruct_box = gr.Textbox(
+                    label="Extra instruct (optional)",
+                    lines=3,
+                    placeholder="Optional style prompt to send through to the backend.",
+                )
+                model_dropdown = gr.Dropdown(
+                    label="Model",
+                    choices=initial_models,
+                    value=initial_model_value,
+                    allow_custom_value=False,
+                )
+                speed_slider = gr.Slider(
+                    0.5,
+                    2.0,
+                    value=1.0,
+                    step=0.05,
+                    label="Speed",
+                )
+                format_dropdown = gr.Dropdown(
+                    label="Response format",
+                    choices=["mp3", "wav", "flac", "ogg", "opus"],
+                    value="mp3",
+                    allow_custom_value=False,
+                )
+                with gr.Row():
+                    generate_button = gr.Button("Generate / 生成", variant="primary")
+                    refresh_button = gr.Button("Refresh backend catalog")
+            with gr.Column(scale=1):
+                output_audio = gr.Audio(
+                    label="Output Audio / 合成结果",
+                    type="filepath",
+                    elem_classes="compact-audio",
+                )
+                status_box = gr.Textbox(
+                    label="Status / 状态",
+                    value=initial_status,
+                    lines=4,
+                )
+
+        refresh_button.click(
+            _refresh_catalog,
+            inputs=[voice_map_state],
+            outputs=[model_dropdown, voice_dropdown, status_box, voice_map_state],
+        )
+        generate_button.click(
+            _generate_from_backend,
+            inputs=[
+                input_text,
+                model_dropdown,
+                voice_dropdown,
+                language_dropdown,
+                instruct_box,
+                speed_slider,
+                format_dropdown,
+                voice_map_state,
+            ],
+            outputs=[output_audio, status_box],
+        )
+
+    return demo
 
 
 # ---------------------------------------------------------------------------
@@ -502,6 +800,18 @@ def main(argv=None) -> int:
     )
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.backend_url:
+        backend_url = _normalize_backend_url(args.backend_url)
+        logging.info("Starting Gradio frontend against OmniVoice backend %s", backend_url)
+        demo = build_backend_demo(backend_url, timeout=args.backend_timeout)
+        demo.queue().launch(
+            server_name=args.ip,
+            server_port=args.port,
+            share=args.share,
+            root_path=args.root_path,
+        )
+        return 0
 
     device = args.device or get_best_device()
 

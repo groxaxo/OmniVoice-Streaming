@@ -42,6 +42,7 @@ API_MODEL_ID = os.getenv("OMNIVOICE_API_MODEL_ID", "omnivoice")
 DEFAULT_HOST = os.getenv("OMNIVOICE_HOST", "0.0.0.0")
 DEFAULT_PORT = int(os.getenv("OMNIVOICE_PORT", "6655"))
 DEFAULT_VOICE = os.getenv("OMNIVOICE_DEFAULT_VOICE", "alloy")
+DEFAULT_NUM_STEP = int(os.getenv("OMNIVOICE_DEFAULT_NUM_STEP", "32"))
 DEFAULT_AUDIO_CHUNK_DURATION = float(
     os.getenv("OMNIVOICE_AUDIO_CHUNK_DURATION", "15.0")
 )
@@ -59,6 +60,73 @@ MAX_RAW_INPUT_CHARS = int(
     os.getenv("OMNIVOICE_MAX_RAW_INPUT_CHARS", str(MAX_SANITIZED_INPUT_CHARS * 2))
 )
 DEBUG_PREVIEW_CHARS = int(os.getenv("OMNIVOICE_DEBUG_PREVIEW_CHARS", "160"))
+USE_PYAV_ENCODER = os.getenv("OMNIVOICE_USE_PYAV_ENCODER", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+}
+COMPILE_LLM = os.getenv("OMNIVOICE_COMPILE_LLM", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+COMPILE_LLM_MODE = os.getenv("OMNIVOICE_COMPILE_LLM_MODE", "reduce-overhead")
+REQUIRE_LLM_COMPILE = os.getenv("OMNIVOICE_REQUIRE_LLM_COMPILE", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+PREWARM_VOICES = [
+    item.strip().lower()
+    for item in os.getenv("OMNIVOICE_PREWARM_VOICES", "").split(",")
+    if item.strip()
+]
+PRELOAD_MODEL = os.getenv("OMNIVOICE_PRELOAD_MODEL", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+STARTUP_WARMUP_TEXT = os.getenv("OMNIVOICE_STARTUP_WARMUP_TEXT", "").strip()
+STARTUP_WARMUP_VOICE = os.getenv("OMNIVOICE_STARTUP_WARMUP_VOICE", DEFAULT_VOICE)
+STARTUP_WARMUP_NUM_STEP = int(
+    os.getenv("OMNIVOICE_STARTUP_WARMUP_NUM_STEP", str(DEFAULT_NUM_STEP))
+)
+SYNTHESIS_CONCURRENCY = max(1, int(os.getenv("OMNIVOICE_SYNTHESIS_CONCURRENCY", "1")))
+ACCESS_LOG = os.getenv("OMNIVOICE_ACCESS_LOG", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+}
+DISABLE_ASR = os.getenv("OMNIVOICE_DISABLE_ASR", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+# By default the API server skips CPU postprocessing (remove_silence + trim_trailing_artifact)
+# to reduce latency; set OMNIVOICE_POSTPROCESS_OUTPUT=1 to re-enable for audiobook use.
+DEFAULT_POSTPROCESS_OUTPUT = os.getenv("OMNIVOICE_POSTPROCESS_OUTPUT", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+UVICORN_LOOP = os.getenv("OMNIVOICE_UVICORN_LOOP", "uvloop")
+UVICORN_HTTP = os.getenv("OMNIVOICE_UVICORN_HTTP", "httptools")
+
+
+def _apply_global_inference_tuning() -> None:
+    try:
+        import torch as _torch  # local import to avoid touching CUDA at module import time
+
+        _torch.set_float32_matmul_precision("high")
+        if _torch.cuda.is_available():
+            _torch.backends.cuda.matmul.allow_tf32 = True
+            _torch.backends.cudnn.allow_tf32 = True
+            _torch.backends.cudnn.benchmark = True
+    except Exception:
+        pass
+
+
+_apply_global_inference_tuning()
 LOCAL_VOICE_REFERENCE_ROOT = Path(
     os.getenv("OMNIVOICE_LOCAL_VOICE_ROOT", "/home/op/Libro-Gregoria-Variacion/audio")
 )
@@ -671,18 +739,52 @@ VOICE_OPTIONS: list[VoiceOptionDefinition] = [
     ),
 ]
 VOICE_LOOKUP = {item.id: item for item in VOICE_OPTIONS}
+DEFAULT_VOICE_ALIASES = (
+    "m1=monica,"
+    "default=monica,"
+    "monicaoptimized=monica,"
+    "monicaoptimized.wav=monica,"
+    "monica-optimized=monica,"
+    "monica_optimized=monica"
+)
+
+
+def _parse_voice_aliases(raw: str) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    for item in raw.split(","):
+        if not item.strip() or "=" not in item:
+            continue
+        source, target = item.split("=", 1)
+        source_key = source.strip().lower()
+        target_key = target.strip().lower()
+        if source_key and target_key:
+            aliases[source_key] = target_key
+    return aliases
+
+
+VOICE_ALIASES = _parse_voice_aliases(
+    os.getenv("OMNIVOICE_VOICE_ALIASES", DEFAULT_VOICE_ALIASES)
+)
 SUPPORTED_MODEL_OPTIONS = [
     {"id": API_MODEL_ID, "name": "OmniVoice"},
     {"id": "tts-1", "name": "OmniVoice (OpenAI alias)"},
     {"id": "tts-1-hd", "name": "OmniVoice HD (OpenAI alias)"},
     {"id": "gpt-4o-mini-tts", "name": "OmniVoice mini TTS (OpenAI alias)"},
+    {"id": "supertonic", "name": "OmniVoice (DealerVoice/Supertonic alias)"},
+    {"id": "soprano", "name": "OmniVoice (DealerVoice/Soprano alias)"},
+    {"id": "chatterbox", "name": "OmniVoice (DealerVoice/Chatterbox alias)"},
 ]
 SUPPORTED_MODEL_ALIASES = {
     API_MODEL_ID,
     BACKEND_MODEL_ID,
+    BACKEND_MODEL_ID.lower(),
     "tts-1",
     "tts-1-hd",
     "gpt-4o-mini-tts",
+    "supertonic",
+    "soprano",
+    "chatterbox",
+    "chatterbox-turbo",
 }
 SUPPORTED_RESPONSE_FORMATS = {
     "mp3": ("audio/mpeg", "mp3"),
@@ -1076,10 +1178,12 @@ class SpeechRequest(BaseModel):
     response_format: Literal["mp3", "wav", "flac", "ogg", "opus"] = "mp3"
     speed: float = Field(default=1.0, gt=0.0, le=4.0)
     language: Optional[str] = Field(default=None, max_length=64)
+    lang_code: Optional[str] = Field(default=None, max_length=64)
     ref_text: Optional[str] = Field(default=None, max_length=MAX_RAW_INPUT_CHARS)
     instruct: Optional[str] = Field(default=None, max_length=1024)
     duration: Optional[float] = Field(default=None, gt=0.0, le=3600.0)
     num_step: Optional[int] = Field(default=None, ge=1, le=128)
+    total_steps: Optional[int] = Field(default=None, ge=1, le=128)
     guidance_scale: Optional[float] = Field(default=None, ge=0.0, le=20.0)
     t_shift: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     denoise: Optional[bool] = None
@@ -1173,6 +1277,8 @@ class OmniVoiceService:
         self._idle_timeout = idle_timeout
         self._idle_task: asyncio.Task | None = None
         self._last_used: float = 0.0
+        self._active_requests: int = 0
+        self.generation_semaphore: asyncio.Semaphore | None = None
         self._voice_prompt_cache: _VoicePromptLRUCache = _VoicePromptLRUCache(
             maxsize=128
         )
@@ -1180,9 +1286,23 @@ class OmniVoiceService:
     def set_lock(self, lock: asyncio.Lock) -> None:
         self.load_lock = lock
 
+    def set_generation_semaphore(self, semaphore: asyncio.Semaphore) -> None:
+        self.generation_semaphore = semaphore
+
     def _touch(self) -> None:
         self._last_used = time.monotonic()
         self._schedule_idle_offload()
+
+    def _begin_request(self) -> None:
+        self._active_requests += 1
+        self._last_used = time.monotonic()
+        if self._idle_task is not None:
+            self._idle_task.cancel()
+            self._idle_task = None
+
+    def _end_request(self) -> None:
+        self._active_requests = max(0, self._active_requests - 1)
+        self._touch()
 
     def _schedule_idle_offload(self) -> None:
         if self._idle_task is not None:
@@ -1201,6 +1321,14 @@ class OmniVoiceService:
                     break
                 await asyncio.sleep(remaining)
         except asyncio.CancelledError:
+            return
+
+        if self._active_requests > 0:
+            LOG.info(
+                "Idle timeout reached but %d request(s) are active; deferring offload",
+                self._active_requests,
+            )
+            self._schedule_idle_offload()
             return
 
         if self.model is not None:
@@ -1243,6 +1371,7 @@ class OmniVoiceService:
     def _load_model_sync(self) -> OmniVoice:
         LOG.info("Loading OmniVoice model %s on %s", self.model_id, self.device)
         if self.device.startswith("cuda"):
+            torch.set_float32_matmul_precision("high")
             from transformers import modeling_utils
 
             original_allocator_warmup = modeling_utils.caching_allocator_warmup
@@ -1264,12 +1393,97 @@ class OmniVoiceService:
                 device_map=self.device,
             )
         model.eval()
+        if COMPILE_LLM and self.device.startswith("cuda"):
+            try:
+                LOG.info(
+                    "Compiling OmniVoice LLM with torch.compile(mode=%s)",
+                    COMPILE_LLM_MODE,
+                )
+                model.llm = torch.compile(
+                    model.llm,
+                    mode=COMPILE_LLM_MODE,
+                    dynamic=True,
+                    fullgraph=False,
+                )
+                LOG.info("OmniVoice LLM compile wrapper installed")
+            except Exception:
+                LOG.exception("Failed to compile OmniVoice LLM")
+                if REQUIRE_LLM_COMPILE:
+                    raise
+
+        for voice_id in PREWARM_VOICES:
+            resolved_voice = _resolve_voice(voice_id)
+            if resolved_voice.ref_audio_path is None:
+                LOG.info(
+                    "Skipping prewarm for %s because it has no local reference",
+                    voice_id,
+                )
+                continue
+            LOG.info("Prewarming voice clone prompt for %s", voice_id)
+            self.get_or_create_voice_clone_prompt(
+                model,
+                cache_key=(
+                    f"{resolved_voice.ref_audio_path.resolve()}::"
+                    f"{resolved_voice.ref_text!r}"
+                ),
+                ref_audio_path=resolved_voice.ref_audio_path,
+                ref_text=resolved_voice.ref_text,
+            )
+
+        self._startup_warmup_sync(model)
+
         LOG.info(
             "Model loaded on %s with sampling rate %s",
             model.device,
             getattr(model, "sampling_rate", "unknown"),
         )
         return model
+
+    def _startup_warmup_sync(self, model: OmniVoice) -> None:
+        if not STARTUP_WARMUP_TEXT:
+            return
+
+        resolved_voice = _resolve_voice(STARTUP_WARMUP_VOICE)
+        generation_args: dict[str, object] = {
+            "text": STARTUP_WARMUP_TEXT,
+            "language": resolved_voice.default_language,
+            "generation_config": OmniVoiceGenerationConfig(
+                num_step=STARTUP_WARMUP_NUM_STEP,
+                audio_chunk_duration=DEFAULT_AUDIO_CHUNK_DURATION,
+                audio_chunk_threshold=DEFAULT_AUDIO_CHUNK_THRESHOLD,
+                postprocess_output=False,
+            ),
+        }
+        if resolved_voice.ref_audio_path is not None:
+            generation_args["voice_clone_prompt"] = self.get_or_create_voice_clone_prompt(
+                model,
+                cache_key=(
+                    f"{resolved_voice.ref_audio_path.resolve()}::"
+                    f"{resolved_voice.ref_text!r}"
+                ),
+                ref_audio_path=resolved_voice.ref_audio_path,
+                ref_text=resolved_voice.ref_text,
+            )
+        elif resolved_voice.instruct is not None:
+            generation_args["instruct"] = resolved_voice.instruct
+
+        LOG.info(
+            "Running startup synthesis warmup (voice=%s, num_step=%d)",
+            resolved_voice.voice_id,
+            STARTUP_WARMUP_NUM_STEP,
+        )
+        started = time.perf_counter()
+        with torch.inference_mode():
+            audios = model.generate(**generation_args)
+        elapsed = time.perf_counter() - started
+        seconds = 0.0
+        if audios:
+            seconds = float(audios[0].numel()) / float(getattr(model, "sampling_rate", 1))
+        LOG.info(
+            "Startup synthesis warmup complete in %.2fs for %.2fs audio",
+            elapsed,
+            seconds,
+        )
 
     async def get_model(self) -> OmniVoice:
         if self.model is not None:
@@ -1335,6 +1549,7 @@ class ASRService:
         self._idle_timeout = idle_timeout
         self._idle_task: asyncio.Task | None = None
         self._last_used: float = 0.0
+        self._active_requests: int = 0
 
     def set_lock(self, lock: asyncio.Lock) -> None:
         self.load_lock = lock
@@ -1342,6 +1557,17 @@ class ASRService:
     def _touch(self) -> None:
         self._last_used = time.monotonic()
         self._schedule_idle_offload()
+
+    def _begin_request(self) -> None:
+        self._active_requests += 1
+        self._last_used = time.monotonic()
+        if self._idle_task is not None:
+            self._idle_task.cancel()
+            self._idle_task = None
+
+    def _end_request(self) -> None:
+        self._active_requests = max(0, self._active_requests - 1)
+        self._touch()
 
     def _schedule_idle_offload(self) -> None:
         if self._idle_task is not None:
@@ -1871,7 +2097,15 @@ def _supported_models() -> list[dict[str, str]]:
 
 
 def _supported_voices() -> list[dict[str, str]]:
-    return [{"id": item.id, "name": item.display_name()} for item in VOICE_OPTIONS]
+    voices = [{"id": item.id, "name": item.display_name()} for item in VOICE_OPTIONS]
+    known_ids = {item["id"].lower() for item in voices}
+    for alias, target in sorted(VOICE_ALIASES.items()):
+        if alias in known_ids:
+            continue
+        target_voice = VOICE_LOOKUP.get(target)
+        target_name = target_voice.display_name() if target_voice else target
+        voices.append({"id": alias, "name": f"{alias} (alias for {target_name})"})
+    return voices
 
 
 def _truncate_preview(text: Optional[str], limit: int = DEBUG_PREVIEW_CHARS) -> str:
@@ -2177,12 +2411,18 @@ async def _handle_audio_transcription(
 def _resolve_model(requested: Optional[str]) -> str:
     if not requested:
         return API_MODEL_ID
-    if requested in SUPPORTED_MODEL_ALIASES or requested == service.model_id:
+    requested_clean = requested.strip()
+    requested_key = requested_clean.lower()
+    if (
+        requested_clean in SUPPORTED_MODEL_ALIASES
+        or requested_key in SUPPORTED_MODEL_ALIASES
+        or requested_clean == service.model_id
+    ):
         return API_MODEL_ID
     raise HTTPException(
         status_code=400,
         detail=(
-            f"Unsupported model '{requested}'. Supported aliases: "
+            f"Unsupported model '{requested_clean}'. Supported aliases: "
             f"{', '.join(sorted(SUPPORTED_MODEL_ALIASES))}"
         ),
     )
@@ -2194,6 +2434,7 @@ def _resolve_voice(requested: Optional[str]) -> ResolvedVoice:
         raise HTTPException(status_code=400, detail="voice must not be empty")
 
     voice_key = voice.lower()
+    voice_key = VOICE_ALIASES.get(voice_key, voice_key)
     preset = VOICE_LOOKUP.get(voice_key)
     if preset is not None:
         use_local_sample = preset.has_local_sample()
@@ -2220,7 +2461,7 @@ def _prepare_request(payload: SpeechRequest) -> PreparedSpeechRequest:
     _resolve_model(payload.model)
     response_format = payload.response_format
     resolved_voice = _resolve_voice(payload.voice)
-    effective_language = payload.language or resolved_voice.default_language
+    effective_language = payload.language or payload.lang_code or resolved_voice.default_language
 
     text = sanitize_speech_text(
         payload.raw_text(),
@@ -2267,6 +2508,11 @@ def _prepare_request(payload: SpeechRequest) -> PreparedSpeechRequest:
         value = getattr(payload, field_name)
         if value is not None:
             generation_config_kwargs[field_name] = value
+    generation_config_kwargs.setdefault("num_step", DEFAULT_NUM_STEP)
+    if payload.num_step is None and payload.total_steps is not None:
+        generation_config_kwargs["num_step"] = payload.total_steps
+    # Apply server-default postprocess setting unless the caller explicitly overrode it.
+    generation_config_kwargs.setdefault("postprocess_output", DEFAULT_POSTPROCESS_OUTPUT)
 
     generation_config_kwargs["audio_chunk_duration"] = (
         payload.audio_chunk_duration
@@ -2301,6 +2547,50 @@ def _prepare_request(payload: SpeechRequest) -> PreparedSpeechRequest:
     )
 
 
+def _encode_with_pyav(
+    pcm_waveform: torch.Tensor,
+    sample_rate: int,
+    response_format: str,
+) -> bytes:
+    import av
+
+    codec_by_format = {
+        "mp3": "libmp3lame",
+        "flac": "flac",
+        "ogg": "libopus",
+        "opus": "libopus",
+    }
+    container_by_format = {
+        "mp3": "mp3",
+        "flac": "flac",
+        "ogg": "ogg",
+        "opus": "ogg",
+    }
+    codec = codec_by_format[response_format]
+    container_format = container_by_format[response_format]
+    channels = int(pcm_waveform.shape[0])
+    if channels == 1:
+        layout = "mono"
+    elif channels == 2:
+        layout = "stereo"
+    else:
+        raise RuntimeError(f"PyAV encoder does not support {channels} channels")
+
+    buffer = io.BytesIO()
+    ndarray = pcm_waveform.numpy()
+    with av.open(buffer, mode="w", format=container_format) as container:
+        stream = container.add_stream(codec, rate=sample_rate)
+        if response_format == "mp3":
+            stream.bit_rate = 192_000
+        frame = av.AudioFrame.from_ndarray(ndarray, format="s16", layout=layout)
+        frame.sample_rate = sample_rate
+        for packet in stream.encode(frame):
+            container.mux(packet)
+        for packet in stream.encode(None):
+            container.mux(packet)
+    return buffer.getvalue()
+
+
 def _waveform_to_bytes(
     waveform: torch.Tensor,
     sample_rate: int,
@@ -2317,6 +2607,19 @@ def _waveform_to_bytes(
     # in-memory BytesIO WAV output in this environment. Write canonical PCM WAV
     # bytes ourselves, then feed those bytes to ffmpeg for compressed formats.
     pcm_waveform = (waveform * 32767.0).round().to(torch.int16).contiguous()
+
+    if response_format != "wav" and USE_PYAV_ENCODER:
+        try:
+            return (
+                _encode_with_pyav(pcm_waveform, sample_rate, response_format),
+                media_type,
+            )
+        except Exception:
+            LOG.exception(
+                "PyAV audio encoding failed for response_format=%s; falling back to ffmpeg",
+                response_format,
+            )
+
     if pcm_waveform.shape[0] == 1:
         pcm_bytes = pcm_waveform.squeeze(0).numpy().tobytes()
     else:
@@ -2447,8 +2750,12 @@ async def _synthesize_prepared(
             prepared.response_format,
         )
 
+    service._begin_request()
     try:
-        audio_bytes, media_type = await asyncio.to_thread(_run_generation)
+        if service.generation_semaphore is None:
+            raise RuntimeError("Generation semaphore is not initialized")
+        async with service.generation_semaphore:
+            audio_bytes, media_type = await asyncio.to_thread(_run_generation)
     except HTTPException:
         raise
     except Exception as exc:
@@ -2462,9 +2769,12 @@ async def _synthesize_prepared(
             prepared.language,
         )
         raise HTTPException(status_code=500, detail="Speech synthesis failed") from exc
+    finally:
+        # Reset idle timer only after synthesis completion/failure and never while
+        # a generation is in progress. This prevents the worker from killing
+        # itself mid-job during long audiobook/chunked renders.
+        service._end_request()
 
-    # Reset idle timer so the full idle window starts from synthesis completion.
-    service._touch()
     return prepared, audio_bytes, media_type
 
 
@@ -2472,6 +2782,7 @@ async def _synthesize_prepared(
 async def lifespan(_: FastAPI):
     _configure_logging()
     service.set_lock(asyncio.Lock())
+    service.set_generation_semaphore(asyncio.Semaphore(SYNTHESIS_CONCURRENCY))
     asr_service.set_lock(asyncio.Lock())
     LOG.info(
         "Starting OmniVoice TTS server (api_model=%s, backend_model=%s, device=%s, idle_timeout=%.0fs, asr_model=%s, asr_device=%s, asr_idle_timeout=%.0fs)",
@@ -2483,6 +2794,9 @@ async def lifespan(_: FastAPI):
         asr_service.device,
         asr_service._idle_timeout,
     )
+    if PRELOAD_MODEL:
+        LOG.info("Preloading OmniVoice model during startup")
+        await service.get_model()
     yield
     if service._idle_task is not None:
         service._idle_task.cancel()
@@ -2764,8 +3078,10 @@ def main() -> None:
         host=args.host,
         port=args.port,
         log_level="info",
-        access_log=True,
+        access_log=ACCESS_LOG,
         workers=1,
+        loop=UVICORN_LOOP,
+        http=UVICORN_HTTP,
     )
 
 

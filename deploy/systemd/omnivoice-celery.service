@@ -1,0 +1,19 @@
+[Unit]
+Description=OmniVoice Celery GPU Worker Spawner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/op/OmniVoice
+EnvironmentFile=/home/op/.config/omnivoice/omnivoice-pool.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/op/OmniVoice/.venv/bin/python -m omnivoice.gpu_pool_celery
+Restart=always
+RestartSec=5
+TimeoutStartSec=180
+TimeoutStopSec=30
+KillMode=control-group
+
+[Install]
+WantedBy=default.target

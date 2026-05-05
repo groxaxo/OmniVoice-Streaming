@@ -26,5 +26,6 @@ examples/data*
 examples/download*
 examples/exp*/
 .claude/
+.firecrawl/
 *.wav
 *.jsonl

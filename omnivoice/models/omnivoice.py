@@ -241,6 +241,11 @@ class OmniVoice(PreTrainedModel):
         self.duration_estimator = None
         self.sampling_rate = None
         self._asr_pipe = None
+        # LRU cache for inference attention masks — keyed by (c_lens, target_lens,
+        # max_seq_len).  A single entry covers the common single-request case; the
+        # cache is bounded to 4 entries to accommodate short shape variety without
+        # unbounded memory growth.
+        self._attn_mask_cache: dict[tuple, torch.Tensor] = {}
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
@@ -284,6 +289,29 @@ class OmniVoice(PreTrainedModel):
                 pretrained_model_name_or_path, *args, **kwargs
             )
 
+            # Re-initialize non-persistent computed buffers.
+            # When loading a BF16 checkpoint with dtype=float32, HuggingFace uses
+            # meta-device initialization (to avoid holding both precisions in RAM
+            # simultaneously).  Non-persistent buffers are NOT in the state_dict so
+            # they remain as uninitialized CUDA memory after the meta->real move,
+            # producing garbage values (e.g. -1e35) that corrupt the training loss.
+            buf_device = next(model.parameters()).device
+            model.register_buffer(
+                "normalized_codebook_weight_tensor",
+                torch.tensor(
+                    model.normalized_audio_codebook_weights,
+                    dtype=torch.float32,
+                ).to(buf_device),
+                persistent=False,
+            )
+            model.register_buffer(
+                "inference_layer_ids",
+                torch.arange(
+                    model.config.num_audio_codebook, dtype=torch.float32
+                ).view(1, -1, 1).to(buf_device),
+                persistent=False,
+            )
+
             if not train_mode:
                 # Resolve local path for audio tokenizer subdirectory
                 if os.path.isdir(pretrained_model_name_or_path):
@@ -308,8 +336,14 @@ class OmniVoice(PreTrainedModel):
                 tokenizer_device = (
                     "cpu" if str(model.device).startswith("mps") else model.device
                 )
+                # Load the audio tokenizer in the same reduced precision as the main
+                # model — the F32 safetensors is cast at load time, halving VRAM and
+                # memory bandwidth on every encode/decode call.
+                _tok_dtype = resolve_inference_dtype(tokenizer_device)
                 model.audio_tokenizer = HiggsAudioV2TokenizerModel.from_pretrained(
-                    audio_tokenizer_path, device_map=tokenizer_device
+                    audio_tokenizer_path,
+                    device_map=tokenizer_device,
+                    torch_dtype=_tok_dtype,
                 )
                 model.feature_extractor = AutoFeatureExtractor.from_pretrained(
                     audio_tokenizer_path
@@ -421,17 +455,25 @@ class OmniVoice(PreTrainedModel):
         inputs_embeds = self._prepare_embed_inputs(input_ids, audio_mask)
 
         if attention_mask is None and document_ids is not None:
-            attention_mask = create_block_mask(
-                _get_packed_mask(
-                    document_ids[0].to(inputs_embeds.device),
-                ),
-                B=None,
-                H=None,
-                Q_LEN=input_ids.size(-1),
-                KV_LEN=input_ids.size(-1),
-                _compile=True,
-                device=inputs_embeds.device,
-            )
+            attn_impl = getattr(self.llm.config, "_attn_implementation", None)
+            if attn_impl == "flex_attention":
+                attention_mask = create_block_mask(
+                    _get_packed_mask(
+                        document_ids[0].to(inputs_embeds.device),
+                    ),
+                    B=None,
+                    H=None,
+                    Q_LEN=input_ids.size(-1),
+                    KV_LEN=input_ids.size(-1),
+                    _compile=True,
+                    device=inputs_embeds.device,
+                )
+            else:
+                attention_mask = _build_training_attention_mask(
+                    document_ids.to(inputs_embeds.device),
+                    device=inputs_embeds.device,
+                    dtype=inputs_embeds.dtype,
+                )
 
         llm_outputs = self.llm(
             inputs_embeds=inputs_embeds,
@@ -1209,6 +1251,12 @@ class OmniVoice(PreTrainedModel):
 
         c_lens = [inp["input_ids"].size(2) for inp in inputs_list]
         max_c_len = max(c_lens)
+        # Bucket max_c_len to fixed multiples so torch.compile can reuse cached
+        # specialisations across requests whose natural sequence lengths differ by
+        # only a few tokens.  Controlled by OMNIVOICE_SHAPE_BUCKET (default 64).
+        _bucket = int(os.getenv("OMNIVOICE_SHAPE_BUCKET", "64"))
+        if _bucket > 1:
+            max_c_len = (max_c_len + _bucket - 1) // _bucket * _bucket
         pad_id = self.config.audio_mask_id  # Or any other tokens
 
         batch_input_ids = torch.full(
@@ -1220,12 +1268,20 @@ class OmniVoice(PreTrainedModel):
         batch_audio_mask = torch.zeros(
             (2 * B, max_c_len), dtype=torch.bool, device=self.device
         )
-        batch_attention_mask = _build_inference_attention_mask(
-            c_lens=c_lens,
-            target_lens=task.target_lens,
-            max_seq_len=max_c_len,
-            device=self.device,
-        )
+        # Look up a cached attention mask by (c_lens, target_lens, max_seq_len) before
+        # building a fresh quadratic tensor for every request.
+        _mask_key = (tuple(c_lens), tuple(task.target_lens), max_c_len)
+        batch_attention_mask = self._attn_mask_cache.get(_mask_key)
+        if batch_attention_mask is None:
+            batch_attention_mask = _build_inference_attention_mask(
+                c_lens=c_lens,
+                target_lens=task.target_lens,
+                max_seq_len=max_c_len,
+                device=self.device,
+            )
+            if len(self._attn_mask_cache) >= 4:
+                self._attn_mask_cache.pop(next(iter(self._attn_mask_cache)))
+            self._attn_mask_cache[_mask_key] = batch_attention_mask
 
         for i, inp in enumerate(inputs_list):
             c_len, u_len = c_lens[i], task.target_lens[i]
@@ -1319,11 +1375,12 @@ class OmniVoice(PreTrainedModel):
         return [tokens[i, :, : task.target_lens[i]] for i in range(B)]
 
     def _predict_tokens_with_scoring(self, c_logits, u_logits, gen_config):
-        log_prob_dtype = (
-            torch.float32
-            if c_logits.dtype in (torch.float16, torch.bfloat16)
-            else c_logits.dtype
-        )
+        # Keep bf16/fp16 log_softmax on CUDA — numerically safe on Ampere+ (RTX 3060/3090)
+        # and avoids a costly float32 upcast on every diffusion step.
+        if c_logits.dtype in (torch.float16, torch.bfloat16) and c_logits.is_cuda:
+            log_prob_dtype = c_logits.dtype
+        else:
+            log_prob_dtype = torch.float32
         if gen_config.guidance_scale != 0:
             c_log_probs = F.log_softmax(c_logits, dim=-1, dtype=log_prob_dtype)
             u_log_probs = F.log_softmax(u_logits, dim=-1, dtype=log_prob_dtype)
@@ -1397,6 +1454,28 @@ def _build_inference_attention_mask(
                 pad_diag = torch.arange(active_len, max_seq_len, device=device)
                 mask[row_index, :, pad_diag, pad_diag] = True
 
+    return mask
+
+
+def _build_training_attention_mask(
+    document_ids: torch.Tensor,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Build a dense additive attention mask for packed training batches.
+
+    Tokens may attend to positions that share the same packed document id.
+    Padding positions already carry unique negative ids, so they only attend to
+    themselves.
+    """
+    doc_ids = document_ids.to(device)
+    allowed = doc_ids.unsqueeze(1) == doc_ids.unsqueeze(2)  # (B, S, S)
+    mask = torch.zeros(
+        (doc_ids.size(0), 1, doc_ids.size(1), doc_ids.size(1)),
+        dtype=dtype,
+        device=device,
+    )
+    mask.masked_fill_(~allowed.unsqueeze(1), torch.finfo(dtype).min)
     return mask
 
 
