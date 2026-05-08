@@ -36,11 +36,18 @@ from dataclasses import dataclass, fields
 from functools import partial
 from typing import Any, List, Optional, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
-from torch.nn.attention.flex_attention import create_block_mask
+
+try:
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    _flex_attention_available = True
+except ImportError:
+    _flex_attention_available = False
 from transformers import (
     AutoFeatureExtractor,
     AutoModel,
@@ -58,12 +65,6 @@ from omnivoice.utils.audio import (
     load_audio,
     remove_silence,
     trim_long_audio,
-    trim_trailing_artifact,
-)
-from omnivoice.utils.common import (
-    configure_cuda_inference,
-    resolve_device_string,
-    resolve_inference_dtype,
 )
 from omnivoice.utils.duration import RuleDurationEstimator
 from omnivoice.utils.lang_map import LANG_IDS, LANG_NAMES
@@ -187,9 +188,18 @@ class OmniVoiceConfig(PretrainedConfig):
         self.audio_codebook_weights = audio_codebook_weights
 
 
+def _resolve_model_path(name_or_path: str) -> str:
+    if os.path.isdir(name_or_path):
+        return name_or_path
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(name_or_path)
+
+
 class OmniVoice(PreTrainedModel):
     _supports_flex_attn = True
     _supports_flash_attn_2 = True
+    _supports_sdpa = True
     config_class = OmniVoiceConfig
 
     def __init__(self, config: OmniVoiceConfig, llm: Optional[PreTrainedModel] = None):
@@ -222,16 +232,6 @@ class OmniVoice(PreTrainedModel):
             w / sum(config.audio_codebook_weights)
             for w in config.audio_codebook_weights
         ]
-        self.register_buffer(
-            "normalized_codebook_weight_tensor",
-            torch.tensor(self.normalized_audio_codebook_weights, dtype=torch.float32),
-            persistent=False,
-        )
-        self.register_buffer(
-            "inference_layer_ids",
-            torch.arange(config.num_audio_codebook, dtype=torch.float32).view(1, -1, 1),
-            persistent=False,
-        )
 
         self.post_init()
 
@@ -247,64 +247,29 @@ class OmniVoice(PreTrainedModel):
         train_mode = kwargs.pop("train", False)
         load_asr = kwargs.pop("load_asr", False)
         asr_model_name = kwargs.pop("asr_model_name", "openai/whisper-large-v3-turbo")
-        requested_dtype = kwargs.pop("dtype", None)
-        requested_torch_dtype = kwargs.pop("torch_dtype", None)
-        if requested_dtype is not None and requested_torch_dtype is not None:
-            if requested_dtype != requested_torch_dtype:
-                raise ValueError(
-                    "dtype and torch_dtype must match when both are provided."
-                )
-
-        load_device = kwargs.get("device_map")
-        resolved_device = resolve_device_string(load_device)
-        resolved_dtype = (
-            requested_dtype if requested_dtype is not None else requested_torch_dtype
-        )
-
-        if not train_mode:
-            kwargs["dtype"] = resolve_inference_dtype(
-                load_device, "auto" if resolved_dtype is None else resolved_dtype
-            )
-            if resolved_device.startswith("cuda"):
-                configure_cuda_inference(load_device)
-                # OmniVoice is a custom model that does not register SDPA/flex_attention
-                # dispatch; use eager (still benefits from TF32 and cuDNN tuning set
-                # above).  flex_attention requires a Triton kernel that exceeds the
-                # RTX 3060's shared-memory limit (107 KB needed vs 99 KB available).
-                kwargs.setdefault("attn_implementation", "eager")
-        elif resolved_dtype is not None:
-            kwargs["dtype"] = resolved_dtype
 
         # Suppress noisy INFO logs from transformers/huggingface_hub during loading
         _prev_disable = logging.root.manager.disable
         logging.disable(logging.INFO)
 
         try:
-            model = super().from_pretrained(
-                pretrained_model_name_or_path, *args, **kwargs
-            )
+            # Resolve to local path first; download only if not already cached
+            resolved_path = _resolve_model_path(pretrained_model_name_or_path)
+
+            model = super(cls, cls).from_pretrained(resolved_path, *args, **kwargs)
 
             if not train_mode:
-                # Resolve local path for audio tokenizer subdirectory
-                if os.path.isdir(pretrained_model_name_or_path):
-                    resolved_path = pretrained_model_name_or_path
-                else:
-                    from huggingface_hub import snapshot_download
-
-                    resolved_path = snapshot_download(pretrained_model_name_or_path)
-
-                model.text_tokenizer = AutoTokenizer.from_pretrained(
-                    pretrained_model_name_or_path
-                )
+                model.text_tokenizer = AutoTokenizer.from_pretrained(resolved_path)
 
                 audio_tokenizer_path = os.path.join(resolved_path, "audio_tokenizer")
 
                 if not os.path.isdir(audio_tokenizer_path):
-                    # Fallback to the HuggingFace Hub path of transformers'
-                    # HiggsAudioV2Tokenizer if the local subdirectory doesn't exist.
-                    audio_tokenizer_path = "eustlb/higgs-audio-v2-tokenizer"
+                    audio_tokenizer_path = _resolve_model_path(
+                        "eustlb/higgs-audio-v2-tokenizer"
+                    )
 
-                # higgs-audio-v2-tokenizer does not support MPS (output channels > 65536)
+                # higgs-audio-v2-tokenizer does not support MPS
+                # (output channels > 65536)
                 tokenizer_device = (
                     "cpu" if str(model.device).startswith("mps") else model.device
                 )
@@ -334,29 +299,35 @@ class OmniVoice(PreTrainedModel):
         """Load a Whisper ASR model for reference audio transcription.
 
         Args:
-            model_name: HuggingFace model name for the Whisper model.
+            model_name: HuggingFace model name or local path for the Whisper model.
         """
         from transformers import pipeline as hf_pipeline
 
         logger.info("Loading ASR model %s ...", model_name)
-        asr_dtype = resolve_inference_dtype(self.device)
+        asr_dtype = (
+            torch.float16 if str(self.device).startswith("cuda") else torch.float32
+        )
+
+        model_name = _resolve_model_path(model_name)
+
         self._asr_pipe = hf_pipeline(
             "automatic-speech-recognition",
             model=model_name,
-            dtype=asr_dtype,
-            device_map=self.device,
+            torch_dtype=asr_dtype,
+            device=self.device,
         )
-        logger.info("ASR model loaded on %s.", self.device)
 
     @torch.inference_mode()
     def transcribe(
         self,
-        audio: Union[str, tuple[torch.Tensor, int]],
+        audio: Union[str, tuple],
     ) -> str:
         """Transcribe audio using the loaded Whisper ASR model.
 
         Args:
-            audio: File path or (waveform, sample_rate) tuple.
+            audio: File path or ``(waveform, sample_rate)`` tuple.
+                Waveform can be a numpy array or torch.Tensor of shape
+                ``(1, T)`` or ``(T,)``.
 
         Returns:
             Transcribed text.
@@ -370,12 +341,11 @@ class OmniVoice(PreTrainedModel):
             return self._asr_pipe(audio)["text"].strip()
         else:
             waveform, sr = audio
-            if waveform.dim() == 1:
-                waveform = waveform.unsqueeze(0)
-            if waveform.size(0) > 1:
-                waveform = torch.mean(waveform, dim=0, keepdim=True)
+            if isinstance(waveform, torch.Tensor):
+                waveform = waveform.cpu().numpy()
+            waveform = np.squeeze(waveform)  # (1, T) or (T,) → (T,)
             audio_input = {
-                "array": waveform.squeeze(0).cpu().numpy(),
+                "array": waveform,
                 "sampling_rate": sr,
             }
             return self._asr_pipe(audio_input)["text"].strip()
