@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "omnivoice"
-version = "0.1.3"
+version = "0.1.5"
 description = "OmniVoice: Towards Omnilingual Zero-Shot Text-to-Speech with Diffusion Language Models"
 readme = "README.md"
 license = "Apache-2.0"
@@ -40,6 +40,7 @@ dependencies = [
     "webdataset",
     "numpy",
     "soundfile",
+    "librosa",
     "fastapi>=0.135.2",
     "uvicorn>=0.42.0",
     "inflect>=7.5.0",
@@ -49,7 +50,6 @@ dependencies = [
 
 eval = [
     "jiwer==3.1.0",       # WER
-    "librosa",             # Audio processing
     "s3prl",               # Speech representation (HuBERT etc.)
     "funasr",              # ASR models
     "zhconv",              # Chinese character normalization
